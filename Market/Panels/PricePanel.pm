@@ -10,13 +10,19 @@ use strict;
 use warnings;
 use POSIX qw(floor);
 
-# Paleta de colores estilo TradingView oscuro
-my $COLOR_BG        = '#131722';
-my $COLOR_BULL      = '#26a69a';   # vela alcista (cierre >= apertura)
-my $COLOR_BEAR      = '#ef5350';   # vela bajista (cierre < apertura)
-my $COLOR_CROSSH    = '#9598a1';   # crosshair y etiquetas
-my $COLOR_PRICE_TXT = '#ffffff';
-my $COLOR_TIME_TXT  = '#787b86';
+# Paleta de colores estilo TradingView
+my $COLOR_BG        = '#ffffff';
+
+# Velas
+my $COLOR_BULL      = '#089981';
+my $COLOR_BEAR      = '#f23645';
+
+# Crosshair
+my $COLOR_CROSSH    = '#b2b5be';
+
+# Textos
+my $COLOR_PRICE_TXT = '#131722';
+my $COLOR_TIME_TXT  = '#6b7280';
 
 # ------------------------------------------------------------------------------
 # new
@@ -28,18 +34,20 @@ my $COLOR_TIME_TXT  = '#787b86';
 #   scale_w  : ancho reservado para la escala derecha (px)
 # ------------------------------------------------------------------------------
 sub new {
-    my ($class, %args) = @_;
+    my ( $class, %args ) = @_;
     my $self = {
         canvas   => $args{canvas},
         canvas_w => $args{canvas_w} // 1200,
         canvas_h => $args{canvas_h} // 400,
         scale_w  => $args{scale_w}  // 70,
         scale    => undef,
+
         # Estado del crosshair (objetos pre-creados)
         _ch_vline => undef,
         _ch_hline => undef,
         _ch_label => undef,
         _ch_box   => undef,
+
         # Ultimo precio visible para la etiqueta derecha
         _last_price => undef,
     };
@@ -61,21 +69,29 @@ sub _init_crosshair_objects {
 
     $self->{_ch_vline} = $c->createLine(
         -1, 0, -1, $self->{canvas_h},
-        -fill => $COLOR_CROSSH, -dash => [1, 1], -tags => ['crosshair']
+        -fill => $COLOR_CROSSH,
+        -dash => [ 1, 1 ],
+        -tags => ['crosshair']
     );
     $self->{_ch_hline} = $c->createLine(
         0, -1, $self->{canvas_w}, -1,
-        -fill => $COLOR_CROSSH, -dash => [1, 1], -tags => ['crosshair']
+        -fill => $COLOR_CROSSH,
+        -dash => [ 1, 1 ],
+        -tags => ['crosshair']
     );
     $self->{_ch_box} = $c->createRectangle(
         $self->_scale_x(), -1, $self->{canvas_w}, -1,
-        -fill => $COLOR_CROSSH, -outline => '', -tags => ['crosshair']
+        -fill    => $COLOR_CROSSH,
+        -outline => '',
+        -tags    => ['crosshair']
     );
     $self->{_ch_label} = $c->createText(
         $self->_scale_x() + 4, -1,
-        -text => '', -anchor => 'w',
-        -fill => $COLOR_PRICE_TXT, -font => ['Courier', 9, 'bold'],
-        -tags => ['crosshair']
+        -text   => '',
+        -anchor => 'w',
+        -fill   => $COLOR_PRICE_TXT,
+        -font   => [ 'Courier', 9, 'bold' ],
+        -tags   => ['crosshair']
     );
 }
 
@@ -84,8 +100,8 @@ sub _init_crosshair_objects {
 # Redondeo auxiliar al entero mas cercano.
 # ------------------------------------------------------------------------------
 sub round {
-    my ($self, $value) = @_;
-    return int($value + 0.5);
+    my ( $self, $value ) = @_;
+    return int( $value + 0.5 );
 }
 
 # ------------------------------------------------------------------------------
@@ -96,18 +112,67 @@ sub round {
 # Retorna: ($y_min, $y_max)
 # ------------------------------------------------------------------------------
 sub get_y_range {
-    my ($self, $data) = @_;
-    return (0, 1) unless @$data;
+    my ( $self, $data ) = @_;
+
+    return ( 0, 1 ) unless @$data;
 
     my $min = $data->[0]{low};
     my $max = $data->[0]{high};
-    for my $c (@$data) {
-        $min = $c->{low}  if $c->{low}  < $min;
-        $max = $c->{high} if $c->{high} > $max;
+
+    foreach my $c (@$data) {
+
+        $min = $c->{low}
+          if $c->{low} < $min;
+
+        $max = $c->{high}
+          if $c->{high} > $max;
     }
-    my $margin = ($max - $min) * 0.05;
-    $margin = 1.0 if $margin < 0.01;
-    return ($min - $margin, $max + $margin);
+
+    # -----------------------------------
+    # Padding dinámico
+    # -----------------------------------
+
+    my $range = $max - $min;
+
+    $range = 1
+      if $range <= 0;
+
+    my $padding = $range * 0.12;
+
+    # Padding mínimo estable
+    $padding = 0.5
+      if $padding < 0.5;
+
+    my $target_min = $min - $padding;
+
+    my $target_max = $max + $padding;
+
+    # -----------------------------------
+    # Suavizado temporal
+    # -----------------------------------
+
+    if (   defined $self->{_smooth_y_min}
+        && defined $self->{_smooth_y_max} )
+    {
+
+        my $alpha = 0.18;
+
+        $self->{_smooth_y_min} =
+          $self->{_smooth_y_min} +
+          ( ( $target_min - $self->{_smooth_y_min} ) * $alpha );
+
+        $self->{_smooth_y_max} =
+          $self->{_smooth_y_max} +
+          ( ( $target_max - $self->{_smooth_y_max} ) * $alpha );
+    }
+    else {
+
+        $self->{_smooth_y_min} = $target_min;
+
+        $self->{_smooth_y_max} = $target_max;
+    }
+
+    return ( $self->{_smooth_y_min}, $self->{_smooth_y_max}, );
 }
 
 # ------------------------------------------------------------------------------
@@ -116,7 +181,7 @@ sub get_y_range {
 # Parametro $scale: objeto Market::Panels::Scales
 # ------------------------------------------------------------------------------
 sub set_scale {
-    my ($self, $scale) = @_;
+    my ( $self, $scale ) = @_;
     $self->{scale} = $scale;
 }
 
@@ -129,7 +194,7 @@ sub set_scale {
 #   $scale  : objeto Market::Panels::Scales configurado para esta vista
 # ------------------------------------------------------------------------------
 sub render {
-    my ($self, $canvas, $data, $scale) = @_;
+    my ( $self, $canvas, $data, $scale ) = @_;
 
     # Sincronizar escala interna con la recibida
     $self->set_scale($scale);
@@ -140,24 +205,54 @@ sub render {
     $canvas->delete('lastprice');
 
     # Fondo oscuro
-    $canvas->createRectangle(
-        0, 0, $self->{canvas_w}, $self->{canvas_h},
-        -fill => $COLOR_BG, -outline => '', -tags => ['candles']
-    );
+    # Crear fondo una sola vez
+    unless ( $self->{_bg_created} ) {
+
+        $canvas->createRectangle(
+            0,
+            0,
+            $self->{canvas_w},
+            $self->{canvas_h},
+
+            -fill    => $COLOR_BG,
+            -outline => '',
+            -tags    => ['background']
+        );
+
+        $self->{_bg_created} = 1;
+    }
 
     # FIX: usar _bar_width (metodo privado de Scales)
-    my $bar_w  = $scale->_bar_width();
-    my $body_w = $bar_w * 0.6;
+    my $bar_w = $scale->_bar_width();
+
+    # Limitar tamaños extremos
+    $bar_w = 2  if $bar_w < 2;
+    $bar_w = 80 if $bar_w > 80;
+
+    # Separación visual consistente
+    my $body_w = $bar_w * 0.72;
+
+    # Mantener visible el cuerpo
     $body_w = 1 if $body_w < 1;
 
-    for my $i (0 .. $#$data) {
-        my $c   = $data->[$i];
-        my $cx  = $scale->index_to_center_x($scale->{offset} + $i);
+    # Evitar cuerpos absurdamente grandes
+    $body_w = $bar_w - 2
+      if $body_w > ( $bar_w - 2 );
 
-        my $y_open  = $scale->value_to_y($c->{open});
-        my $y_close = $scale->value_to_y($c->{close});
-        my $y_high  = $scale->value_to_y($c->{high});
-        my $y_low   = $scale->value_to_y($c->{low});
+    for my $i ( 0 .. $#$data ) {
+        my $c = $data->[$i];
+
+        my $idx = $scale->{offset} + $i;
+        my $cx  = $scale->index_to_center_x($idx);
+
+        # Saltar velas completamente fuera del viewport
+        next if $cx < -$bar_w;
+        next if $cx > $scale->_chart_w() + $bar_w;
+
+        my $y_open  = $scale->value_to_y( $c->{open} );
+        my $y_close = $scale->value_to_y( $c->{close} );
+        my $y_high  = $scale->value_to_y( $c->{high} );
+        my $y_low   = $scale->value_to_y( $c->{low} );
 
         my $bull  = $c->{close} >= $c->{open};
         my $color = $bull ? $COLOR_BULL : $COLOR_BEAR;
@@ -165,15 +260,16 @@ sub render {
         # Mecha (high - low)
         $canvas->createLine(
             $cx, $y_high, $cx, $y_low,
-            -fill => $color, -width => 1,
-            -tags => ['candles']
+            -fill  => $color,
+            -width => 1,
+            -tags  => ['candles']
         );
 
         # Cuerpo (open - close)
         my $y_top = $bull ? $y_close : $y_open;
         my $y_bot = $bull ? $y_open  : $y_close;
         my $half  = $body_w / 2.0;
-        $y_bot = $y_top + 1 if ($y_bot - $y_top) < 1;
+        $y_bot = $y_top + 1 if ( $y_bot - $y_top ) < 1;
 
         $canvas->createRectangle(
             $cx - $half, $y_top, $cx + $half, $y_bot,
@@ -183,11 +279,11 @@ sub render {
         );
     }
 
-    # FIX: guardar ultimo precio visible antes de llamar render_last_visible_price
+  # FIX: guardar ultimo precio visible antes de llamar render_last_visible_price
     $self->{_last_price} = $data->[-1]{close} if @$data;
 
     # Escala derecha Y y etiqueta del ultimo precio
-    $scale->_draw_y_scale($canvas, '%.2f', 'yscale');
+    $scale->_draw_y_scale( $canvas, '%.2f', 'yscale' );
     $self->render_last_visible_price($canvas);
 }
 
@@ -196,7 +292,7 @@ sub render {
 # Dibuja la etiqueta del ultimo precio visible en la escala derecha.
 # ------------------------------------------------------------------------------
 sub render_last_visible_price {
-    my ($self, $canvas) = @_;
+    my ( $self, $canvas ) = @_;
     my $scale = $self->{scale};
     return unless defined $scale && defined $self->{_last_price};
 
@@ -205,18 +301,22 @@ sub render_last_visible_price {
     my $price = $self->{_last_price};
     my $y     = $scale->value_to_y($price);
     my $x     = $scale->_chart_w();
-    my $label = sprintf('%.2f', $price);
+    my $label = sprintf( '%.2f', $price );
     my $lw    = length($label) * 7 + 8;
 
     $canvas->createRectangle(
         $x, $y - 9, $x + $lw, $y + 9,
-        -fill => $COLOR_CROSSH, -outline => '', -tags => ['lastprice']
+        -fill    => $COLOR_CROSSH,
+        -outline => '',
+        -tags    => ['lastprice']
     );
     $canvas->createText(
         $x + 4, $y,
-        -text => $label, -anchor => 'w',
-        -fill => $COLOR_PRICE_TXT, -font => ['Courier', 9, 'bold'],
-        -tags => ['lastprice']
+        -text   => $label,
+        -anchor => 'w',
+        -fill   => $COLOR_PRICE_TXT,
+        -font   => [ 'Courier', 9, 'bold' ],
+        -tags   => ['lastprice']
     );
 }
 
@@ -226,7 +326,7 @@ sub render_last_visible_price {
 # Parametros: $x, $y coordenadas en pixels dentro del canvas
 # ------------------------------------------------------------------------------
 sub draw_crosshair {
-    my ($self, $x, $y) = @_;
+    my ( $self, $x, $y ) = @_;
     my $c     = $self->{canvas};
     my $scale = $self->{scale};
     return unless defined $c && defined $scale;
@@ -234,17 +334,17 @@ sub draw_crosshair {
     my $w = $self->{canvas_w};
     my $h = $self->{canvas_h};
 
-    $c->coords($self->{_ch_vline}, $x, 0,  $x, $h);
-    $c->coords($self->{_ch_hline}, 0,  $y, $w, $y);
+    $c->coords( $self->{_ch_vline}, $x, 0,  $x, $h );
+    $c->coords( $self->{_ch_hline}, 0,  $y, $w, $y );
 
     my $price = $scale->y_to_value($y);
-    my $label = sprintf('%.2f', $price);
+    my $label = sprintf( '%.2f', $price );
     my $lw    = length($label) * 7 + 8;
     my $sx    = $self->_scale_x();
 
-    $c->coords($self->{_ch_box},   $sx, $y - 9, $w, $y + 9);
-    $c->coords($self->{_ch_label}, $sx + 4, $y);
-    $c->itemconfigure($self->{_ch_label}, -text => $label);
+    $c->coords( $self->{_ch_box}, $sx, $y - 9, $w, $y + 9 );
+    $c->coords( $self->{_ch_label}, $sx + 4, $y );
+    $c->itemconfigure( $self->{_ch_label}, -text => $label );
 
     $c->raise('crosshair');
 }
@@ -257,7 +357,7 @@ sub draw_crosshair {
 #   $timestamps : arrayref de hashrefs { idx => ..., label => ... }
 # ------------------------------------------------------------------------------
 sub draw_time_axis {
-    my ($self, $canvas, $timestamps) = @_;
+    my ( $self, $canvas, $timestamps ) = @_;
     my $scale = $self->{scale};
     return unless defined $scale;
 
@@ -276,15 +376,17 @@ sub draw_time_axis {
         # Tick vertical corto
         $canvas->createLine(
             $x, $y_tick, $x, $y_tick + 4,
-            -fill => '#787b86', -tags => ['timescale']
+            -fill => '#787b86',
+            -tags => ['timescale']
         );
+
         # Etiqueta de tiempo
         $canvas->createText(
             $x, $y_label,
             -text   => $label,
             -anchor => 'center',
             -fill   => $COLOR_TIME_TXT,
-            -font   => ['Courier', 8],
+            -font   => [ 'Courier', 8 ],
             -tags   => ['timescale']
         );
     }

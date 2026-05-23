@@ -45,8 +45,14 @@ sub _chart_h {
 # ------------------------------------------------------------------------------
 sub index_to_x {
     my ($self, $index) = @_;
-    my $bar_w = $self->_chart_w() / $self->{visible_bars};
-    return ($index - $self->{offset}) * $bar_w;
+
+    my $usable_width =
+        $self->{canvas_w} - $self->{scale_w};
+
+    my $bar_width =
+        $usable_width / $self->{visible_bars};
+
+    return ($index - $self->{offset}) * $bar_width;
 }
 
 # ------------------------------------------------------------------------------
@@ -55,8 +61,16 @@ sub index_to_x {
 # ------------------------------------------------------------------------------
 sub index_to_center_x {
     my ($self, $index) = @_;
-    my $bar_w = $self->_chart_w() / $self->{visible_bars};
-    return ($index - $self->{offset}) * $bar_w + $bar_w / 2.0;
+
+    my $usable_width =
+        $self->{canvas_w} - $self->{scale_w};
+
+    my $bar_width =
+        $usable_width / $self->{visible_bars};
+
+    return (
+        ($index - $self->{offset}) * $bar_width
+    ) + ($bar_width / 2);
 }
 
 # ------------------------------------------------------------------------------
@@ -65,8 +79,17 @@ sub index_to_center_x {
 # ------------------------------------------------------------------------------
 sub x_to_index {
     my ($self, $x) = @_;
-    my $bar_w = $self->_chart_w() / $self->{visible_bars};
-    return int($x / $bar_w) + $self->{offset};
+
+    my $usable_width =
+        $self->{canvas_w} - $self->{scale_w};
+
+    my $bar_width =
+        $usable_width / $self->{visible_bars};
+
+    return int(
+        ($x / $bar_width)
+        + $self->{offset}
+    );
 }
 
 # ------------------------------------------------------------------------------
@@ -75,8 +98,16 @@ sub x_to_index {
 # ------------------------------------------------------------------------------
 sub x_to_index_float {
     my ($self, $x) = @_;
-    my $bar_w = $self->_chart_w() / $self->{visible_bars};
-    return ($x / $bar_w) + $self->{offset};
+
+    my $usable_width =
+        $self->{canvas_w} - $self->{scale_w};
+
+    my $bar_width =
+        $usable_width / $self->{visible_bars};
+
+    return (
+        $x / $bar_width
+    ) + $self->{offset};
 }
 
 # ------------------------------------------------------------------------------
@@ -150,12 +181,12 @@ sub _draw_y_scale {
     # Fondo de la franja de escala derecha
     $canvas->createRectangle(
         $x_left, 0, $self->{canvas_w}, $self->{canvas_h},
-        -fill => '#131722', -outline => '', -tags => [$tag]
+        -fill => '#ffffff', -outline => '', -tags => [$tag]
     );
     # Linea separadora panel / escala
     $canvas->createLine(
         $x_left, 0, $x_left, $self->{canvas_h},
-        -fill => '#2a2e39', -tags => [$tag]
+        -fill => '#111827', -tags => [$tag]
     );
 
     my $val = $first;
@@ -165,19 +196,19 @@ sub _draw_y_scale {
         # Linea guia horizontal tenue
         $canvas->createLine(
             0, $y, $x_left, $y,
-            -fill => '#2a2e39', -dash => [2, 4], -tags => [$tag]
+            -fill => '#111827', -dash => [2, 4], -tags => [$tag]
         );
         # Tick en la escala
         $canvas->createLine(
             $x_left, $y, $x_left + 5, $y,
-            -fill => '#787b86', -tags => [$tag]
+            -fill => '#111827', -tags => [$tag]
         );
         # Etiqueta de precio/valor
         $canvas->createText(
             $x_left + 8, $y,
             -text   => sprintf($fmt, $val),
             -anchor => 'w',
-            -fill   => '#d1d4dc',
+            -fill   => '#111827',
             -font   => ['Courier', 9],
             -tags   => [$tag]
         );
