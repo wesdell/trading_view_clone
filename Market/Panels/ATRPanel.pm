@@ -1,231 +1,273 @@
 package Market::Panels::ATRPanel;
 
-# ==============================================================================
+# =============================================================================
 # Market::Panels::ATRPanel
-# Responsabilidad: Renderizar el indicador ATR en un panel separado
-# con su propia escala vertical independiente.
-# ==============================================================================
+# Panel inferior: linea continua del indicador ATR + regleta Y propia.
+#
+# Coordenadas:
+#   visible_atr es un slice RELATIVO (i=0 = primera barra visible).
+#   scale se construye con offset=0 y visible_bars = len(visible_atr).
+#   Asi x = index_to_center_x(i) coincide con el panel de precios.
+#
+# Color: linea rojo bordo #b71c1c, grosor 1.5px.
+# =============================================================================
 
 use strict;
 use warnings;
 
-my $COLOR_BG      = '#131722';
-my $COLOR_ATR     = '#2196f3';   # linea ATR (azul TradingView)
-my $COLOR_CROSSH  = '#9598a1';
-my $COLOR_VAL_TXT = '#ffffff';
-my $COLOR_LBL_TXT = '#2196f3';
+use constant {
+    COLOR_ATR   => '#b71c1c',
+    COLOR_CROSS => '#9598a1',
+    BG_COLOR    => '#ffffff',
+};
 
-# ------------------------------------------------------------------------------
-# new
-# Inicializa el panel ATR.
-# Parametros (hash):
-#   canvas   : widget Tk::Canvas
-#   canvas_w : ancho del canvas en pixels
-#   canvas_h : alto del canvas en pixels
-#   scale_w  : ancho de la escala derecha en pixels
-# ------------------------------------------------------------------------------
 sub new {
     my ($class, %args) = @_;
     my $self = {
-        canvas   => $args{canvas},
-        canvas_w => $args{canvas_w} // 1200,
-        canvas_h => $args{canvas_h} // 150,
-        scale_w  => $args{scale_w}  // 70,
-        scale    => undef,
-        _ch_vline => undef,
-        _ch_hline => undef,
-        _ch_label => undef,
-        _ch_box   => undef,
-        _last_atr => undef,
+        canvas        => $args{canvas},
+        scale         => undef,
+        price_scale_w => $args{price_scale_w} // 90,
+        _ch_vline     => undef,
+        _ch_hline     => undef,
+        _ch_label_bg  => undef,
+        _ch_label     => undef,
+        _cross_ready  => 0,
     };
     bless $self, $class;
-    $self->_init_crosshair();
     return $self;
 }
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # _init_crosshair
-# Pre-crea los objetos graficos del crosshair del panel ATR.
-# Misma estrategia que PricePanel: crear una vez, mover en cada evento.
-# ------------------------------------------------------------------------------
+# Crea los items del crosshair UNA SOLA VEZ.
+# -----------------------------------------------------------------------------
 sub _init_crosshair {
     my ($self) = @_;
     my $c = $self->{canvas};
-    return unless defined $c;
+    return unless $c;
+    return if $self->{_cross_ready};
 
-    my $sx = $self->{canvas_w} - $self->{scale_w};
+    $self->{_ch_vline} = $c->createLine(0, 0, 0, 1,
+        -fill  => COLOR_CROSS,
+        -dash  => [4, 4],
+        -state => 'hidden',
+        -tags  => ['crosshair_atr']);
+    $self->{_ch_hline} = $c->createLine(0, 0, 1, 0,
+        -fill  => COLOR_CROSS,
+        -dash  => [4, 4],
+        -state => 'hidden',
+        -tags  => ['crosshair_atr']);
+    $self->{_ch_label_bg} = $c->createRectangle(0, 0, 1, 1,
+        -fill    => '#363a45',
+        -outline => '#363a45',
+        -state   => 'hidden',
+        -tags    => ['crosshair_atr']);
+    $self->{_ch_label} = $c->createText(0, 0,
+        -text   => '',
+        -fill   => '#ffffff',
+        -anchor => 'center',
+        -font   => 'TkFixedFont 8 bold',
+        -state  => 'hidden',
+        -tags   => ['crosshair_atr']);
 
-    $self->{_ch_vline} = $c->createLine(
-        -1, 0, -1, $self->{canvas_h},
-        -fill => $COLOR_CROSSH, -dash => [1, 1], -tags => ['crosshair']
-    );
-    $self->{_ch_hline} = $c->createLine(
-        0, -1, $self->{canvas_w}, -1,
-        -fill => $COLOR_CROSSH, -dash => [1, 1], -tags => ['crosshair']
-    );
-    $self->{_ch_box} = $c->createRectangle(
-        $sx, -1, $self->{canvas_w}, -1,
-        -fill => $COLOR_CROSSH, -outline => '', -tags => ['crosshair']
-    );
-    $self->{_ch_label} = $c->createText(
-        $sx + 4, -1,
-        -text => '', -anchor => 'w',
-        -fill => $COLOR_VAL_TXT, -font => ['Courier', 9, 'bold'],
-        -tags => ['crosshair']
-    );
+    $self->{_cross_ready} = 1;
 }
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # get_y_range
-# Calcula el rango del ATR visible ignorando undefs del warmup.
-# Agrega margen del 20% para que la linea no toque los bordes del panel.
-# Parametro $values: arrayref de valores ATR (puede contener undef)
-# Retorna: ($y_min, $y_max)
-# ------------------------------------------------------------------------------
+# Min/Max del ATR visible. ATR siempre >= 0.
+# Margen del 10% sobre el max para que la linea no toque el borde superior.
+# El piso es 0 (mejor visualizacion de la base).
+# -----------------------------------------------------------------------------
 sub get_y_range {
     my ($self, $values) = @_;
-    my @valid = grep { defined $_ } @$values;
-    return (0, 1) unless @valid;
+    return (0, 1) unless $values && @$values;
 
-    my $min = $valid[0];
-    my $max = $valid[0];
-    for my $v (@valid) {
-        $min = $v if $v < $min;
-        $max = $v if $v > $max;
+    my $max;
+    for my $v (@$values) {
+        next unless defined $v;
+        $max = $v if !defined $max || $v > $max;
     }
-    my $margin = ($max - $min) * 0.20;
-    $margin = 0.01 if $margin < 0.001;
-    return ($min - $margin, $max + $margin);
+    return (0, 1) unless defined $max;
+
+    my $mg = $max * 0.10;
+    $mg = 0.0001 if $mg < 0.0001;
+
+    return (0, $max + $mg);
 }
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # set_scale
-# Asigna el objeto Scales al panel.
-# Parametro $scale: objeto Market::Panels::Scales
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 sub set_scale {
     my ($self, $scale) = @_;
     $self->{scale} = $scale;
 }
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # render
-# Dibuja la linea del ATR en el canvas.
-# Parametros:
-#   $canvas : widget Tk::Canvas
-#   $values : arrayref de valores ATR visibles (slice sincronizado con velas)
-#   $scale  : objeto Market::Panels::Scales
-# ------------------------------------------------------------------------------
+# Dibuja fondo + escala + linea ATR. Maneja gaps (undef) y valores fuera
+# del rango Y (se interrumpe el segmento al salir del rango).
+#
+# $values: arrayref relativo (i=0 = primera barra visible).
+# $scale : con offset=0, visible_bars = scalar(@$values).
+# -----------------------------------------------------------------------------
 sub render {
     my ($self, $canvas, $values, $scale) = @_;
+    return unless $values && @$values;
 
-    # FIX: sincronizar escala interna antes de llamar render_last_visible_value
-    $self->set_scale($scale);
+    $canvas->delete('atr_all');
 
-    $canvas->delete('atr_line');
-    $canvas->delete('yscale');
-    $canvas->delete('atr_label');
-    $canvas->delete('lastatr');
+    # Fondo blanco
+    $canvas->createRectangle(0, 0, $scale->{canvas_w}, $scale->{canvas_h},
+        -fill => BG_COLOR, -outline => BG_COLOR, -tags => ['atr_all']);
 
-    # Fondo oscuro
-    $canvas->createRectangle(
-        0, 0, $self->{canvas_w}, $self->{canvas_h},
-        -fill => $COLOR_BG, -outline => '', -tags => ['atr_line']
-    );
+    # Escala Y (grilla + etiquetas)
+    $scale->_draw_y_scale($canvas);
 
-    # Etiqueta del indicador (esquina superior izquierda)
-    $canvas->createText(
-        6, 6,
+    # Etiqueta del nombre del indicador (arriba izquierda)
+    $canvas->createText(8, 4,
         -text   => 'ATR(14)',
+        -fill   => COLOR_ATR,
         -anchor => 'nw',
-        -fill   => $COLOR_LBL_TXT,
-        -font   => ['Helvetica', 9, 'bold'],
-        -tags   => ['atr_label']
+        -font   => 'TkFixedFont 8 bold',
+        -tags   => ['atr_all'],
     );
 
-    # Construir polilinea con los puntos validos (saltar undefs del warmup)
-    my @points;
-    for my $i (0 .. $#$values) {
-        next unless defined $values->[$i];
-        my $cx = $scale->index_to_center_x($scale->{offset} + $i);
-        my $cy = $scale->value_to_y($values->[$i]);
-        push @points, $cx, $cy;
-    }
+    # Construir segmentos: cada gap (undef) o valor fuera de rango
+    # interrumpe la linea (estilo TradingView).
+    my @seg;
+    my $n = scalar @$values;
 
-    if (@points >= 4) {
-        $canvas->createLine(
-            @points,
-            -fill  => $COLOR_ATR,
+    for my $i (0 .. $n - 1) {
+        my $v = $values->[$i];
+        if (defined $v && $scale->value_in_range($v)) {
+            my $x = $scale->index_to_center_x($i);
+            my $y = $scale->value_to_y($v);
+            push @seg, $x, $y;
+        } else {
+            if (@seg >= 4) {
+                $canvas->createLine(@seg,
+                    -fill  => COLOR_ATR,
+                    -width => 1.5,
+                    -tags  => ['atr_all'],
+                );
+            }
+            @seg = ();
+        }
+    }
+    if (@seg >= 4) {
+        $canvas->createLine(@seg,
+            -fill  => COLOR_ATR,
             -width => 1.5,
-            -tags  => ['atr_line']
+            -tags  => ['atr_all'],
         );
     }
-
-    # Guardar ultimo valor ATR valido visible
-    my ($last_val) = grep { defined $_ } reverse @$values;
-    $self->{_last_atr} = $last_val;
-
-    # Escala derecha Y y etiqueta del ultimo valor
-    $scale->_draw_y_scale($canvas, '%.4f', 'yscale');
-    $self->render_last_visible_value($canvas);
 }
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # render_last_visible_value
-# Muestra el ultimo valor ATR valido en la escala derecha.
-# ------------------------------------------------------------------------------
+# Linea horizontal + caja con el ultimo valor visible del ATR.
+# Solo se dibuja si esta dentro del rango visible.
+# -----------------------------------------------------------------------------
 sub render_last_visible_value {
     my ($self, $canvas) = @_;
-    my $scale = $self->{scale};
-    return unless defined $scale && defined $self->{_last_atr};
+    return unless $self->{scale};
+    my $scale    = $self->{scale};
+    my $last_val = $scale->{last_atr_val};
+    return unless defined $last_val;
+    return unless $scale->value_in_range($last_val);
 
-    $canvas->delete('lastatr');
+    my $y     = $scale->value_to_y($last_val);
+    my $x_sep = $scale->_plot_w;
+    my $x_end = $scale->{canvas_w};
 
-    my $val   = $self->{_last_atr};
-    my $y     = $scale->value_to_y($val);
-    my $x     = $scale->_chart_w();
-    my $label = sprintf('%.4f', $val);
-    my $lw    = length($label) * 7 + 8;
-
-    $canvas->createRectangle(
-        $x, $y - 9, $x + $lw, $y + 9,
-        -fill => $COLOR_ATR, -outline => '', -tags => ['lastatr']
-    );
-    $canvas->createText(
-        $x + 4, $y,
-        -text => $label, -anchor => 'w',
-        -fill => $COLOR_VAL_TXT, -font => ['Courier', 9, 'bold'],
-        -tags => ['lastatr']
-    );
+    $canvas->createLine(0, $y, $x_sep, $y,
+        -fill => COLOR_ATR, -dash => [3,3], -width => 1, -tags => ['atr_all']);
+    $canvas->createRectangle($x_sep+1, $y-9, $x_end-1, $y+9,
+        -fill => COLOR_ATR, -outline => COLOR_ATR, -tags => ['atr_all']);
+    $canvas->createText($x_sep + ($x_end-$x_sep)/2, $y,
+        -text   => sprintf('%.4f', $last_val),
+        -fill   => '#ffffff',
+        -anchor => 'center',
+        -font   => 'TkFixedFont 8 bold',
+        -tags   => ['atr_all']);
 }
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# show_vline_only
+# Muestra SOLO la linea vertical del crosshair (sincronizacion con el
+# panel de precios cuando el cursor esta arriba).
+# -----------------------------------------------------------------------------
+sub show_vline_only {
+    my ($self, $x) = @_;
+    my $c     = $self->{canvas};
+    my $scale = $self->{scale};
+    return unless $c && $scale && defined $self->{_ch_vline};
+
+    my $h     = $scale->{canvas_h};
+    my $x_sep = $scale->_plot_w;
+
+    if ($x < 0 || $x > $x_sep) {
+        $c->itemconfigure('crosshair_atr', -state => 'hidden');
+        return;
+    }
+
+    $c->coords($self->{_ch_vline}, $x, 0, $x, $h);
+    $c->itemconfigure($self->{_ch_vline},    -state => 'normal');
+    $c->itemconfigure($self->{_ch_hline},    -state => 'hidden');
+    $c->itemconfigure($self->{_ch_label_bg}, -state => 'hidden');
+    $c->itemconfigure($self->{_ch_label},    -state => 'hidden');
+
+    $c->raise('crosshair_atr');
+}
+
+# -----------------------------------------------------------------------------
+# hide_crosshair
+# Oculta TODO el crosshair de este panel.
+# -----------------------------------------------------------------------------
+sub hide_crosshair {
+    my ($self) = @_;
+    my $c = $self->{canvas};
+    return unless $c;
+    $c->itemconfigure('crosshair_atr', -state => 'hidden');
+}
+
+# -----------------------------------------------------------------------------
 # draw_crosshair
-# Mueve el crosshair sincronizado a la posicion del mouse.
-# La coordenada X viene del ChartEngine (misma para todos los paneles).
-# Parametros: $x, $y coordenadas en pixels de este canvas
-# ------------------------------------------------------------------------------
+# Mueve los items del crosshair a la posicion (x, y) usando coords().
+# -----------------------------------------------------------------------------
 sub draw_crosshair {
     my ($self, $x, $y) = @_;
     my $c     = $self->{canvas};
     my $scale = $self->{scale};
-    return unless defined $c && defined $scale;
+    return unless $c && $scale && defined $self->{_ch_vline};
 
-    my $w  = $self->{canvas_w};
-    my $h  = $self->{canvas_h};
-    my $sx = $w - $self->{scale_w};
+    my $h     = $scale->{canvas_h};
+    my $x_sep = $scale->_plot_w;
+    my $x_end = $scale->{canvas_w};
 
-    $c->coords($self->{_ch_vline}, $x, 0,  $x, $h);
-    $c->coords($self->{_ch_hline}, 0,  $y, $w, $y);
+    if ($x > $x_sep) {
+        $c->itemconfigure('crosshair_atr', -state => 'hidden');
+        return;
+    }
 
-    my $val   = $scale->y_to_value($y);
-    my $label = sprintf('%.4f', $val);
+    $c->coords($self->{_ch_vline}, $x, 0, $x, $h);
+    $c->itemconfigure($self->{_ch_vline}, -state => 'normal');
 
-    $c->coords($self->{_ch_box},   $sx, $y - 9, $w, $y + 9);
-    $c->coords($self->{_ch_label}, $sx + 4, $y);
-    $c->itemconfigure($self->{_ch_label}, -text => $label);
+    $c->coords($self->{_ch_hline}, 0, $y, $x_sep, $y);
+    $c->itemconfigure($self->{_ch_hline}, -state => 'normal');
 
-    $c->raise('crosshair');
+    my $val = $scale->y_to_value($y);
+    my $lx  = $x_sep + 1;
+    my $lw  = $x_end - $x_sep - 2;
+    $c->coords($self->{_ch_label_bg}, $lx, $y-9, $lx+$lw, $y+9);
+    $c->itemconfigure($self->{_ch_label_bg}, -state => 'normal');
+    $c->coords($self->{_ch_label}, $lx + $lw/2, $y);
+    $c->itemconfigure($self->{_ch_label},
+        -text => sprintf('%.4f', $val), -state => 'normal');
+
+    $c->raise('crosshair_atr');
 }
 
 1;

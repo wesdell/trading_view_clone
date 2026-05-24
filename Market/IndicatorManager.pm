@@ -1,36 +1,32 @@
-# Market::IndicatorManager
-# Responsabilidad: Gestionar multiples indicadores tecnicos de forma
-# desacoplada. Permite registrar, actualizar y consultar indicadores
-# sin acoplarlos al sistema de render.
-# ==============================================================================
-
 package Market::IndicatorManager;
+
+# =============================================================================
+# Market::IndicatorManager
+# Responsabilidad: gestionar indicadores tecnicos desacoplados del render.
+# Permite registrar, recalcular y consultar valores de indicadores.
+#
+# Cada indicador registrado debe implementar:
+#   - update_last($market_data)       (streaming)
+#   - update_at_index($md, $idx)      (rebuild)
+#   - get_values()  -> arrayref
+#   - reset()
+# =============================================================================
 
 use strict;
 use warnings;
 
-# ------------------------------------------------------------------------------
-# new
-# Inicializa el contenedor de indicadores.
-# ------------------------------------------------------------------------------
 sub new {
     my ($class) = @_;
-    my $self = {
-        indicators => {},   # { nombre => objeto_indicador }
-        _order     => [],   # orden de registro (para iteracion determinista)
-    };
-    bless $self, $class;
-    return $self;
+    bless {
+        indicators => {},
+        _order     => [],   # orden de registro (iteracion determinista)
+    }, $class;
 }
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # register
-# Registra un indicador bajo un nombre clave.
-# Permite extensibilidad sin modificar esta clase.
-# Parametros:
-#   $name      : string identificador (ej: 'ATR')
-#   $indicator : objeto con interfaz update_last / get_values / reset
-# ------------------------------------------------------------------------------
+# Registra un indicador bajo un nombre clave (ej: 'atr').
+# -----------------------------------------------------------------------------
 sub register {
     my ($self, $name, $indicator) = @_;
     $self->{indicators}{$name} = $indicator;
@@ -38,12 +34,11 @@ sub register {
         unless grep { $_ eq $name } @{ $self->{_order} };
 }
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # update_last
-# Actualiza todos los indicadores registrados con la ultima vela del mercado.
-# Calculo incremental eficiente: O(1) por indicador despues del warmup.
-# Parametro $market_data: objeto Market::MarketData
-# ------------------------------------------------------------------------------
+# Notifica a cada indicador que llego una nueva vela (la ultima).
+# Uso: streaming en tiempo real.
+# -----------------------------------------------------------------------------
 sub update_last {
     my ($self, $market_data) = @_;
     for my $name (@{ $self->{_order} }) {
@@ -51,49 +46,60 @@ sub update_last {
     }
 }
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# rebuild_all
+# Recalcula todos los indicadores desde cero recorriendo todos los indices.
+# Uso: inicializacion del programa o cambio de timeframe.
+# -----------------------------------------------------------------------------
+sub rebuild_all {
+    my ($self, $market_data) = @_;
+    my $size = $market_data->size;
+    for my $i (0 .. $size - 1) {
+        for my $name (@{ $self->{_order} }) {
+            my $ind = $self->{indicators}{$name};
+            if ($ind->can('update_at_index')) {
+                $ind->update_at_index($market_data, $i);
+            }
+        }
+    }
+}
+
+# -----------------------------------------------------------------------------
 # get
-# Obtiene la referencia al array completo de valores de un indicador.
-# Parametro $name: string nombre del indicador
-# Retorna: arrayref o undef si no existe
-# ------------------------------------------------------------------------------
+# Devuelve el arrayref de valores de un indicador (paralelo a las velas).
+# -----------------------------------------------------------------------------
 sub get {
     my ($self, $name) = @_;
     return undef unless exists $self->{indicators}{$name};
-    return $self->{indicators}{$name}->get_values();
+    return $self->{indicators}{$name}->get_values;
 }
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # slice_array
-# Devuelve una porcion de los valores de un indicador entre $start y $end.
-# Sincroniza con la ventana visible del chart (mismos indices que get_slice).
-# Parametros:
-#   $name  : string nombre del indicador
-#   $start : indice inicial (inclusive)
-#   $end   : indice final   (inclusive)
-# Retorna: lista de valores (puede contener undef en el warmup)
-# ------------------------------------------------------------------------------
+# Devuelve los valores del indicador para el rango [start..end].
+# Los undef se preservan (velas sin valor calculado, p.ej. seed del ATR).
+# -----------------------------------------------------------------------------
 sub slice_array {
     my ($self, $name, $start, $end) = @_;
     my $vals = $self->get($name);
-    return () unless defined $vals;
+    return [] unless defined $vals && @$vals;
 
-    my $n = scalar @$vals;
-    $start = 0      if $start < 0;
-    $end   = $n - 1 if $end   >= $n;
-    return () if $start > $end;
-    return @{$vals}[$start .. $end];
+    my $last = $#$vals;
+    $start = 0     if $start < 0;
+    $end   = $last if $end > $last;
+    return [] if $start > $end;
+
+    return [ @{$vals}[$start .. $end] ];
 }
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # reset_all
-# Reinicia todos los indicadores registrados.
-# Util al cambiar de temporalidad, forzando recalculo completo.
-# ------------------------------------------------------------------------------
+# Reinicia todos los indicadores (necesario al cambiar timeframe).
+# -----------------------------------------------------------------------------
 sub reset_all {
     my ($self) = @_;
     for my $name (@{ $self->{_order} }) {
-        $self->{indicators}{$name}->reset();
+        $self->{indicators}{$name}->reset;
     }
 }
 

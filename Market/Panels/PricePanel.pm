@@ -1,303 +1,424 @@
 package Market::Panels::PricePanel;
 
-# ==============================================================================
+# =============================================================================
 # Market::Panels::PricePanel
-# Responsabilidad: Renderizar el grafico principal de precios (velas japonesas).
-# Maneja escalado vertical, dibujo de velas OHLC, crosshair y eje de tiempo.
-# ==============================================================================
+# Panel principal: dibuja velas japonesas OHLC + escala Y de precios +
+# eje temporal + crosshair + ultimo precio destacado.
+#
+# Reglas:
+#   - El render no hace asunciones sobre el ChartEngine: recibe canvas,
+#     datos y scale como parametros.
+#   - El crosshair se inicializa UNA SOLA VEZ y luego se mueve con coords().
+#   - Las funciones get_y_range / set_scale separan calculo de render.
+# =============================================================================
 
 use strict;
 use warnings;
 use POSIX qw(floor);
 
-# Paleta de colores estilo TradingView oscuro
-my $COLOR_BG        = '#131722';
-my $COLOR_BULL      = '#26a69a';   # vela alcista (cierre >= apertura)
-my $COLOR_BEAR      = '#ef5350';   # vela bajista (cierre < apertura)
-my $COLOR_CROSSH    = '#9598a1';   # crosshair y etiquetas
-my $COLOR_PRICE_TXT = '#ffffff';
-my $COLOR_TIME_TXT  = '#787b86';
+use constant {
+    COLOR_BULL      => '#26a69a',   # verde alcista
+    COLOR_BEAR      => '#ef5350',   # rojo bajista
+    COLOR_BULL_BDR  => '#1a7a72',
+    COLOR_BEAR_BDR  => '#c62828',
+    COLOR_CROSS     => '#9598a1',
+    COLOR_FG        => '#363a45',
+    COLOR_GRID      => '#e0e3eb',
+    COLOR_LAST_BG   => '#2962ff',   # azul TradingView para ultimo precio
+    COLOR_INFO      => '#363a45',
+    BG_COLOR        => '#ffffff',
+    MIN_BODY_H      => 1,
+};
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # new
-# Inicializa el panel de precios.
-# Parametros (hash):
-#   canvas   : widget Tk::Canvas donde se dibuja
-#   canvas_w : ancho del canvas en pixels
-#   canvas_h : alto del canvas en pixels
-#   scale_w  : ancho reservado para la escala derecha (px)
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 sub new {
     my ($class, %args) = @_;
     my $self = {
-        canvas   => $args{canvas},
-        canvas_w => $args{canvas_w} // 1200,
-        canvas_h => $args{canvas_h} // 400,
-        scale_w  => $args{scale_w}  // 70,
-        scale    => undef,
-        # Estado del crosshair (objetos pre-creados)
-        _ch_vline => undef,
-        _ch_hline => undef,
-        _ch_label => undef,
-        _ch_box   => undef,
-        # Ultimo precio visible para la etiqueta derecha
-        _last_price => undef,
+        canvas        => $args{canvas},
+        scale         => undef,
+        price_scale_w => $args{price_scale_w} // 90,
+        # Items del crosshair (creados una vez)
+        _ch_hline     => undef,
+        _ch_vline     => undef,
+        _ch_label_bg  => undef,
+        _ch_label     => undef,
+        _ohlcv_label  => undef,
+        _cross_ready  => 0,
     };
     bless $self, $class;
-    $self->_init_crosshair_objects();
     return $self;
 }
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # _init_crosshair_objects
-# Pre-crea los elementos graficos del crosshair en el canvas.
-# Se crean fuera de pantalla y se reposicionan en cada movimiento del mouse.
-# Esto evita crear/destruir objetos Tk en cada frame — optimizacion clave.
-# ------------------------------------------------------------------------------
+# Crea los items del crosshair UNA SOLA VEZ. Se llaman tras el primer
+# render. En renders siguientes solo se ajustan sus coords (O(1)).
+# -----------------------------------------------------------------------------
 sub _init_crosshair_objects {
     my ($self) = @_;
     my $c = $self->{canvas};
-    return unless defined $c;
+    return unless $c;
+    return if $self->{_cross_ready};
 
-    $self->{_ch_vline} = $c->createLine(
-        -1, 0, -1, $self->{canvas_h},
-        -fill => $COLOR_CROSSH, -dash => [1, 1], -tags => ['crosshair']
+    $self->{_ch_vline} = $c->createLine(0, 0, 0, 1,
+        -fill  => COLOR_CROSS,
+        -dash  => [4, 4],
+        -state => 'hidden',
+        -tags  => ['crosshair_price'],
     );
-    $self->{_ch_hline} = $c->createLine(
-        0, -1, $self->{canvas_w}, -1,
-        -fill => $COLOR_CROSSH, -dash => [1, 1], -tags => ['crosshair']
+    $self->{_ch_hline} = $c->createLine(0, 0, 1, 0,
+        -fill  => COLOR_CROSS,
+        -dash  => [4, 4],
+        -state => 'hidden',
+        -tags  => ['crosshair_price'],
     );
-    $self->{_ch_box} = $c->createRectangle(
-        $self->_scale_x(), -1, $self->{canvas_w}, -1,
-        -fill => $COLOR_CROSSH, -outline => '', -tags => ['crosshair']
+    $self->{_ch_label_bg} = $c->createRectangle(0, 0, 1, 1,
+        -fill    => '#363a45',
+        -outline => '#363a45',
+        -state   => 'hidden',
+        -tags    => ['crosshair_price'],
     );
-    $self->{_ch_label} = $c->createText(
-        $self->_scale_x() + 4, -1,
-        -text => '', -anchor => 'w',
-        -fill => $COLOR_PRICE_TXT, -font => ['Courier', 9, 'bold'],
-        -tags => ['crosshair']
+    $self->{_ch_label} = $c->createText(0, 0,
+        -text   => '',
+        -fill   => '#ffffff',
+        -anchor => 'center',
+        -font   => 'TkFixedFont 8 bold',
+        -state  => 'hidden',
+        -tags   => ['crosshair_price'],
     );
+    # Etiqueta OHLCV arriba izquierda
+    $self->{_ohlcv_label} = $c->createText(8, 6,
+        -text   => '',
+        -fill   => COLOR_INFO,
+        -anchor => 'nw',
+        -font   => 'TkFixedFont 8',
+        -state  => 'hidden',
+        -tags   => ['ohlcv_label'],
+    );
+
+    $self->{_cross_ready} = 1;
 }
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # round
-# Redondeo auxiliar al entero mas cercano.
-# ------------------------------------------------------------------------------
+# Redondeo numerico auxiliar.
+# -----------------------------------------------------------------------------
 sub round {
-    my ($self, $value) = @_;
-    return int($value + 0.5);
+    my ($self, $value, $decimals) = @_;
+    $decimals //= 2;
+    return sprintf("%.${decimals}f", $value) + 0;
 }
 
-# ------------------------------------------------------------------------------
-# get_y_range
-# Calcula el rango de precios min/max del slice visible con margen del 5%.
-# Base para el escalado vertical automatico.
-# Parametro $data: arrayref de hashrefs de velas
-# Retorna: ($y_min, $y_max)
-# ------------------------------------------------------------------------------
-sub get_y_range {
-    my ($self, $data) = @_;
-    return (0, 1) unless @$data;
-
-    my $min = $data->[0]{low};
-    my $max = $data->[0]{high};
-    for my $c (@$data) {
-        $min = $c->{low}  if $c->{low}  < $min;
-        $max = $c->{high} if $c->{high} > $max;
-    }
-    my $margin = ($max - $min) * 0.05;
-    $margin = 1.0 if $margin < 0.01;
-    return ($min - $margin, $max + $margin);
-}
-
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # set_scale
-# Asigna el objeto Scales activo a este panel.
-# Parametro $scale: objeto Market::Panels::Scales
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 sub set_scale {
     my ($self, $scale) = @_;
     $self->{scale} = $scale;
 }
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# get_y_range
+# Min/Max de precios visibles + margen del 3% arriba y abajo.
+# -----------------------------------------------------------------------------
+sub get_y_range {
+    my ($self, $data) = @_;
+    return (0, 1) unless $data && @$data;
+
+    my $max_p = $data->[0]{high};
+    my $min_p = $data->[0]{low};
+    for my $c (@$data) {
+        $max_p = $c->{high} if $c->{high} > $max_p;
+        $min_p = $c->{low}  if $c->{low}  < $min_p;
+    }
+
+    my $margin = ($max_p - $min_p) * 0.03;
+    $margin = 1 if $margin < 1;
+
+    return ($min_p - $margin, $max_p + $margin);
+}
+
+# -----------------------------------------------------------------------------
 # render
-# Dibuja todas las velas visibles. Funcion principal del panel.
-# Parametros:
-#   $canvas : widget Tk::Canvas
-#   $data   : arrayref de velas visibles (slice de MarketData)
-#   $scale  : objeto Market::Panels::Scales configurado para esta vista
-# ------------------------------------------------------------------------------
+# Dibuja fondo, escala Y (grilla + etiquetas), velas.
+# Si una vela esta completamente fuera del rango Y visible, NO se dibuja
+# (asi evitamos amontonarlas en el borde con zoom-in agresivo).
+# -----------------------------------------------------------------------------
 sub render {
     my ($self, $canvas, $data, $scale) = @_;
+    return unless $data && @$data;
 
-    # Sincronizar escala interna con la recibida
-    $self->set_scale($scale);
+    $canvas->delete('candle');
+    $canvas->delete('price_bg');
 
-    $canvas->delete('candles');
-    $canvas->delete('yscale');
-    $canvas->delete('timescale');
-    $canvas->delete('lastprice');
-
-    # Fondo oscuro
-    $canvas->createRectangle(
-        0, 0, $self->{canvas_w}, $self->{canvas_h},
-        -fill => $COLOR_BG, -outline => '', -tags => ['candles']
+    # Fondo blanco del area de plot
+    $canvas->createRectangle(0, 0,
+        $scale->{canvas_w}, $scale->{canvas_h},
+        -fill => BG_COLOR, -outline => BG_COLOR,
+        -tags => ['price_bg'],
     );
 
-    # FIX: usar _bar_width (metodo privado de Scales)
-    my $bar_w  = $scale->_bar_width();
-    my $body_w = $bar_w * 0.6;
-    $body_w = 1 if $body_w < 1;
+    # Escala Y (grilla + etiquetas + borde)
+    $scale->_draw_y_scale($canvas);
+
+    # Geometria de la vela
+    my $bar_w  = $scale->_plot_w / $scale->{visible_bars};
+    my $body_w = $bar_w * 0.65;
+    $body_w    = 1 if $body_w < 1;
+    my $thin   = ($bar_w < 3) ? 1 : 0;
+
+    # Limites Y del area de plot (para culling de velas fuera de rango)
+    my $y_top_plot = $scale->_plot_y_top;
+    my $y_bot_plot = $scale->_plot_y_bottom;
 
     for my $i (0 .. $#$data) {
         my $c   = $data->[$i];
-        my $cx  = $scale->index_to_center_x($scale->{offset} + $i);
+        my $idx = $i + $scale->{offset};
+        my $cx  = $scale->index_to_center_x($idx);
+
+        # Culling: si la vela completa esta arriba o abajo del rango
+        # visible, no la dibujamos. Las velas parcialmente visibles
+        # SI se dibujan (clampeadas por value_to_y al borde del plot).
+        next if ($c->{low}  > $scale->{max_val});
+        next if ($c->{high} < $scale->{min_val});
 
         my $y_open  = $scale->value_to_y($c->{open});
-        my $y_close = $scale->value_to_y($c->{close});
         my $y_high  = $scale->value_to_y($c->{high});
         my $y_low   = $scale->value_to_y($c->{low});
+        my $y_close = $scale->value_to_y($c->{close});
 
-        my $bull  = $c->{close} >= $c->{open};
-        my $color = $bull ? $COLOR_BULL : $COLOR_BEAR;
+        my $bull   = ($c->{close} >= $c->{open});
+        my $color  = $bull ? COLOR_BULL  : COLOR_BEAR;
+        my $border = $thin ? $color : ($bull ? COLOR_BULL_BDR : COLOR_BEAR_BDR);
 
-        # Mecha (high - low)
-        $canvas->createLine(
-            $cx, $y_high, $cx, $y_low,
-            -fill => $color, -width => 1,
-            -tags => ['candles']
-        );
-
-        # Cuerpo (open - close)
-        my $y_top = $bull ? $y_close : $y_open;
-        my $y_bot = $bull ? $y_open  : $y_close;
-        my $half  = $body_w / 2.0;
-        $y_bot = $y_top + 1 if ($y_bot - $y_top) < 1;
+        # Cuerpo de la vela
+        my $y_top  = ($y_close < $y_open) ? $y_close : $y_open;
+        my $y_bot  = ($y_close > $y_open) ? $y_close : $y_open;
+        my $body_h = $y_bot - $y_top;
+        $body_h    = MIN_BODY_H if $body_h < MIN_BODY_H;
 
         $canvas->createRectangle(
-            $cx - $half, $y_top, $cx + $half, $y_bot,
-            -fill    => $color,
-            -outline => $color,
-            -tags    => ['candles']
+            $cx - $body_w/2, $y_top,
+            $cx + $body_w/2, $y_top + $body_h,
+            -fill => $color, -outline => $border,
+            -tags => ['candle'],
         );
+        # Mecha superior
+        $canvas->createLine($cx, $y_high, $cx, $y_top,
+            -fill => $color, -tags => ['candle']);
+        # Mecha inferior
+        $canvas->createLine($cx, $y_top + $body_h, $cx, $y_low,
+            -fill => $color, -tags => ['candle']);
     }
-
-    # FIX: guardar ultimo precio visible antes de llamar render_last_visible_price
-    $self->{_last_price} = $data->[-1]{close} if @$data;
-
-    # Escala derecha Y y etiqueta del ultimo precio
-    $scale->_draw_y_scale($canvas, '%.2f', 'yscale');
-    $self->render_last_visible_price($canvas);
 }
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # render_last_visible_price
-# Dibuja la etiqueta del ultimo precio visible en la escala derecha.
-# ------------------------------------------------------------------------------
+# Linea azul punteada + caja azul con el ultimo precio en la regleta Y.
+# Solo se dibuja si el ultimo precio cae dentro del rango visible.
+# -----------------------------------------------------------------------------
 sub render_last_visible_price {
     my ($self, $canvas) = @_;
+    return unless $self->{scale};
+
     my $scale = $self->{scale};
-    return unless defined $scale && defined $self->{_last_price};
+    $canvas->delete('last_price');
 
-    $canvas->delete('lastprice');
+    my $last_close = $scale->{last_close};
+    return unless defined $last_close;
+    return unless $scale->value_in_range($last_close);
 
-    my $price = $self->{_last_price};
-    my $y     = $scale->value_to_y($price);
-    my $x     = $scale->_chart_w();
-    my $label = sprintf('%.2f', $price);
-    my $lw    = length($label) * 7 + 8;
+    my $y     = $scale->value_to_y($last_close);
+    my $x_sep = $scale->_plot_w;
+    my $x_end = $scale->{canvas_w};
 
-    $canvas->createRectangle(
-        $x, $y - 9, $x + $lw, $y + 9,
-        -fill => $COLOR_CROSSH, -outline => '', -tags => ['lastprice']
-    );
-    $canvas->createText(
-        $x + 4, $y,
-        -text => $label, -anchor => 'w',
-        -fill => $COLOR_PRICE_TXT, -font => ['Courier', 9, 'bold'],
-        -tags => ['lastprice']
-    );
+    # Linea horizontal punteada
+    $canvas->createLine(0, $y, $x_sep, $y,
+        -fill => COLOR_LAST_BG, -dash => [3,3], -width => 1,
+        -tags => ['last_price']);
+
+    # Caja con el precio en la regleta
+    $canvas->createRectangle($x_sep+1, $y-9, $x_end-1, $y+9,
+        -fill => COLOR_LAST_BG, -outline => COLOR_LAST_BG,
+        -tags => ['last_price']);
+
+    $canvas->createText($x_sep + ($x_end-$x_sep)/2, $y,
+        -text => sprintf('%.2f', $last_close),
+        -fill => '#ffffff', -anchor => 'center',
+        -font => 'TkFixedFont 8 bold',
+        -tags => ['last_price']);
 }
 
-# ------------------------------------------------------------------------------
-# draw_crosshair
-# Mueve los objetos pre-creados del crosshair a la posicion del mouse.
-# Parametros: $x, $y coordenadas en pixels dentro del canvas
-# ------------------------------------------------------------------------------
-sub draw_crosshair {
-    my ($self, $x, $y) = @_;
+# -----------------------------------------------------------------------------
+# show_vline_only
+# Muestra SOLO la linea vertical del crosshair (sin label horizontal ni caja
+# de precio). Se usa cuando el cursor esta en OTRO panel pero queremos
+# sincronizar la X aqui tambien.
+# -----------------------------------------------------------------------------
+sub show_vline_only {
+    my ($self, $x) = @_;
     my $c     = $self->{canvas};
     my $scale = $self->{scale};
-    return unless defined $c && defined $scale;
+    return unless $c && $scale && defined $self->{_ch_vline};
 
-    my $w = $self->{canvas_w};
-    my $h = $self->{canvas_h};
+    my $h     = $scale->{canvas_h};
+    my $x_sep = $scale->_plot_w;
 
-    $c->coords($self->{_ch_vline}, $x, 0,  $x, $h);
-    $c->coords($self->{_ch_hline}, 0,  $y, $w, $y);
+    if ($x < 0 || $x > $x_sep) {
+        $c->itemconfigure('crosshair_price', -state => 'hidden');
+        $c->itemconfigure('ohlcv_label',     -state => 'hidden');
+        return;
+    }
 
-    my $price = $scale->y_to_value($y);
-    my $label = sprintf('%.2f', $price);
-    my $lw    = length($label) * 7 + 8;
-    my $sx    = $self->_scale_x();
+    # Snap al centro de la vela mas cercana
+    my $idx    = $scale->x_to_index($x);
+    my $snap_x = $scale->index_to_center_x($idx);
 
-    $c->coords($self->{_ch_box},   $sx, $y - 9, $w, $y + 9);
-    $c->coords($self->{_ch_label}, $sx + 4, $y);
-    $c->itemconfigure($self->{_ch_label}, -text => $label);
+    $c->coords($self->{_ch_vline}, $snap_x, 0, $snap_x, $h);
+    $c->itemconfigure($self->{_ch_vline},    -state => 'normal');
+    $c->itemconfigure($self->{_ch_hline},    -state => 'hidden');
+    $c->itemconfigure($self->{_ch_label_bg}, -state => 'hidden');
+    $c->itemconfigure($self->{_ch_label},    -state => 'hidden');
 
-    $c->raise('crosshair');
+    $c->raise('crosshair_price');
 }
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# show_ohlcv_info
+# Actualiza la etiqueta OHLCV de la vela bajo el cursor. Se llama tanto
+# cuando el mouse esta en este panel como cuando esta en el panel ATR (la X
+# es la misma para los dos paneles).
+# -----------------------------------------------------------------------------
+sub show_ohlcv_info {
+    my ($self, $candle_info) = @_;
+    my $c = $self->{canvas};
+    return unless $c && defined $self->{_ohlcv_label} && $candle_info;
+
+    my $t = $candle_info->{time} // '';
+    $t =~ s/T/ /;
+    $t =~ s/:\d\d[-+]\d\d:\d\d$//;
+    $t =~ s/\..*$//;
+    my $txt = sprintf('%s   O %.2f  H %.2f  L %.2f  C %.2f  V %d',
+        $t,
+        $candle_info->{open}   // 0,
+        $candle_info->{high}   // 0,
+        $candle_info->{low}    // 0,
+        $candle_info->{close}  // 0,
+        $candle_info->{volume} // 0,
+    );
+    $c->itemconfigure($self->{_ohlcv_label},
+        -text => $txt, -state => 'normal');
+    $c->raise('ohlcv_label');
+}
+
+# -----------------------------------------------------------------------------
+# hide_crosshair
+# Oculta TODO el crosshair (incluido OHLCV label).
+# -----------------------------------------------------------------------------
+sub hide_crosshair {
+    my ($self) = @_;
+    my $c = $self->{canvas};
+    return unless $c;
+    $c->itemconfigure('crosshair_price', -state => 'hidden');
+    $c->itemconfigure('ohlcv_label',     -state => 'hidden');
+}
+
+# -----------------------------------------------------------------------------
+# draw_crosshair
+# Crosshair COMPLETO: vline + hline + caja con precio en regleta Y.
+# Se usa cuando el cursor esta DENTRO de este panel.
+# -----------------------------------------------------------------------------
+sub draw_crosshair {
+    my ($self, $x, $y, $candle_info) = @_;
+    my $c     = $self->{canvas};
+    my $scale = $self->{scale};
+    return unless $c && $scale;
+    return unless defined $self->{_ch_vline};
+
+    my $h     = $scale->{canvas_h};
+    my $x_sep = $scale->_plot_w;
+    my $x_end = $scale->{canvas_w};
+
+    if ($x > $x_sep) {
+        $c->itemconfigure('crosshair_price', -state => 'hidden');
+        return;
+    }
+
+    # Snap al centro de la vela mas cercana (comportamiento TradingView)
+    my $idx    = $scale->x_to_index($x);
+    my $snap_x = $scale->index_to_center_x($idx);
+
+    # Linea vertical: en el centro de la vela (snap)
+    $c->coords($self->{_ch_vline}, $snap_x, 0, $snap_x, $h);
+    $c->itemconfigure($self->{_ch_vline}, -state => 'normal');
+
+    # Linea horizontal: libre en Y exacto del mouse
+    $c->coords($self->{_ch_hline}, 0, $y, $x_sep, $y);
+    $c->itemconfigure($self->{_ch_hline}, -state => 'normal');
+
+    # Caja de precio en la regleta Y (usa Y del mouse, no snap)
+    my $price = $scale->y_to_value($y);
+    my $lbl_x = $x_sep + 1;
+    my $lbl_w = $x_end - $x_sep - 2;
+    $c->coords($self->{_ch_label_bg}, $lbl_x, $y-9, $lbl_x+$lbl_w, $y+9);
+    $c->itemconfigure($self->{_ch_label_bg}, -state => 'normal');
+    $c->coords($self->{_ch_label}, $lbl_x + $lbl_w/2, $y);
+    $c->itemconfigure($self->{_ch_label},
+        -text => sprintf('%.2f', $price), -state => 'normal');
+
+    # Info OHLCV
+    if ($candle_info) {
+        $self->show_ohlcv_info($candle_info);
+    }
+
+    $c->raise('crosshair_price');
+}
+
+# -----------------------------------------------------------------------------
 # draw_time_axis
-# Dibuja el eje temporal en la parte inferior del panel de precios.
-# Parametros:
-#   $canvas     : widget Tk::Canvas
-#   $timestamps : arrayref de hashrefs { idx => ..., label => ... }
-# ------------------------------------------------------------------------------
+# Eje temporal inferior con etiquetas tipo TradingView: "Wed 29", "03:00".
+# -----------------------------------------------------------------------------
 sub draw_time_axis {
     my ($self, $canvas, $timestamps) = @_;
+    return unless $timestamps;
     my $scale = $self->{scale};
-    return unless defined $scale;
+    return unless $scale;
 
-    $canvas->delete('timescale');
+    $canvas->delete('time_axis');
 
-    my $y_tick  = $self->{canvas_h} - $scale->{padding_bot};
-    my $y_label = $self->{canvas_h} - 8;
+    my $y_sep  = $scale->{canvas_h} - $scale->{padding_bot};
+    my $y_text = $y_sep + 4;
 
-    for my $entry (@$timestamps) {
-        my $idx   = $entry->{idx};
-        my $label = $entry->{label};
-        my $x     = $scale->index_to_center_x($idx);
+    # Linea separadora horizontal del eje
+    $canvas->createLine(0, $y_sep, $scale->_plot_w, $y_sep,
+        -fill => '#c9cdd7', -tags => ['time_axis']);
 
-        next if $x < 0 || $x > $scale->_chart_w();
+    # Fondo blanco bajo el eje
+    $canvas->createRectangle(0, $y_sep, $scale->_plot_w, $scale->{canvas_h},
+        -fill => BG_COLOR, -outline => BG_COLOR, -tags => ['time_axis']);
 
-        # Tick vertical corto
-        $canvas->createLine(
-            $x, $y_tick, $x, $y_tick + 4,
-            -fill => '#787b86', -tags => ['timescale']
-        );
-        # Etiqueta de tiempo
-        $canvas->createText(
-            $x, $y_label,
-            -text   => $label,
-            -anchor => 'center',
-            -fill   => $COLOR_TIME_TXT,
-            -font   => ['Courier', 8],
-            -tags   => ['timescale']
-        );
+    for my $anchor (@$timestamps) {
+        my $idx = $anchor->{index};
+        next if $idx < $scale->{offset};
+        next if $idx > $scale->{offset} + $scale->{visible_bars};
+
+        my $x = $scale->index_to_center_x($idx);
+        next if $x < 2 || $x > $scale->_plot_w - 2;
+
+        # Marca corta
+        $canvas->createLine($x, $y_sep, $x, $y_sep + 4,
+            -fill => '#c9cdd7', -tags => ['time_axis']);
+
+        # Etiqueta
+        $canvas->createText($x, $y_text + 4,
+            -text   => $anchor->{label},
+            -fill   => '#787b86',
+            -font   => 'TkFixedFont 7',
+            -anchor => 'n',
+            -tags   => ['time_axis']);
     }
-}
-
-# ==============================================================================
-# HELPERS PRIVADOS
-# ==============================================================================
-
-# Coordenada X donde comienza la franja de escala derecha
-sub _scale_x {
-    my ($self) = @_;
-    return $self->{canvas_w} - $self->{scale_w};
 }
 
 1;

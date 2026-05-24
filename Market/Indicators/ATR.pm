@@ -1,129 +1,139 @@
-# ==============================================================================
-# Market::Indicators::ATR
-# Responsabilidad: Calcular el Average True Range (ATR) de Wilder.
-#
-# Algoritmo:
-#   True Range (TR) = max(High-Low, |High-PrevClose|, |Low-PrevClose|)
-#   Primera ATR     = SMA de los primeros $period valores de TR
-#   ATR[i]          = (ATR[i-1] * ($period-1) + TR[i]) / $period   (Wilder)
-#
-# Validacion: resultado debe coincidir con ATR(14) de TradingView.
-# ==============================================================================
-
 package Market::Indicators::ATR;
+
+# =============================================================================
+# Market::Indicators::ATR
+# Average True Range (Wilder) - mismo metodo que TradingView.
+#
+# True Range:
+#   TR = max( H-L,  |H - Close_prev|,  |L - Close_prev| )
+#
+# Suavizado de Wilder:
+#   ATR seed  = SMA de los primeros `period` TRs
+#   ATR(t)    = ( ATR(t-1) * (period-1) + TR(t) ) / period
+#
+# Las primeras (period-1) velas tienen ATR = undef (no calculado todavia).
+# =============================================================================
 
 use strict;
 use warnings;
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # new
-# Inicializa el indicador ATR con su periodo.
-# Parametro $period: entero, por defecto 14 (estandar TradingView / Wilder)
-# ------------------------------------------------------------------------------
+# $period: periodo del ATR (default 14)
+# -----------------------------------------------------------------------------
 sub new {
     my ($class, $period) = @_;
     $period //= 14;
     my $self = {
         period      => $period,
-        values      => [],       # serie completa de valores ATR calculados
-        _tr_buffer  => [],       # buffer de True Range para la fase de warmup
-        _prev_close => undef,    # close de la vela anterior
-        _warmed_up  => 0,        # 1 cuando ya pasamos la fase SMA inicial
+        values      => [],       # ATR calculado por vela (paralelo a candles)
+        _trs        => [],       # True Ranges acumulados (fase seed)
+        _seeded     => 0,        # 1 cuando ya se calculo el seed
+        _last_atr   => undef,    # ATR de la vela anterior (para Wilder)
+        _prev_close => undef,    # close de la vela anterior (para TR)
     };
     bless $self, $class;
     return $self;
 }
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # update_last
-# Actualiza el ATR con la informacion de la ultima vela disponible.
-# Disenado para llamarse incrementalmente: cada vez que se agrega una
-# vela nueva a market_data, se llama este metodo para mantener la serie
-# ATR sincronizada con los datos.
-#
-# Implementa calculo incremental O(1) despues del warmup inicial.
-# Parametro $market_data: objeto Market::MarketData
-# ------------------------------------------------------------------------------
+# Procesa la ULTIMA vela del market_data (recien agregada). Uso: streaming.
+# -----------------------------------------------------------------------------
 sub update_last {
     my ($self, $market_data) = @_;
-
-    my $last = $market_data->last_candle();
+    my $last = $market_data->last_candle;
     return unless defined $last;
+    $self->_process_candle($last);
+}
 
-    my $high  = $last->{high};
-    my $low   = $last->{low};
-    my $close = $last->{close};
+# -----------------------------------------------------------------------------
+# update_at_index
+# Procesa la vela en $idx. Uso: rebuild completo (cambio de timeframe).
+# -----------------------------------------------------------------------------
+sub update_at_index {
+    my ($self, $market_data, $idx) = @_;
+    my $candle = $market_data->get_candle($idx);
+    return unless defined $candle;
+    $self->_process_candle($candle);
+}
 
-    # True Range requiere el close anterior
+# -----------------------------------------------------------------------------
+# _process_candle  (privado)
+# Calcula el TR de la vela y actualiza el ATR aplicando seed o Wilder.
+# -----------------------------------------------------------------------------
+sub _process_candle {
+    my ($self, $c) = @_;
+
+    my $high  = $c->{high};
+    my $low   = $c->{low};
+    my $close = $c->{close};
+
+    # True Range
     my $tr;
-    if (!defined $self->{_prev_close}) {
-        # Primera vela: TR = High - Low (no hay cierre previo)
+    if (defined $self->{_prev_close}) {
+        my $cp = $self->{_prev_close};
+        my $a  = $high - $low;
+        my $b  = abs($high - $cp);
+        my $d  = abs($low  - $cp);
+        $tr = $a;
+        $tr = $b if $b > $tr;
+        $tr = $d if $d > $tr;
+    } else {
         $tr = $high - $low;
     }
-    else {
-        my $pc = $self->{_prev_close};
-        my $hl = $high - $low;
-        my $hc = abs($high - $pc);
-        my $lc = abs($low  - $pc);
-        $tr = $hl;
-        $tr = $hc if $hc > $tr;
-        $tr = $lc if $lc > $tr;
-    }
-
     $self->{_prev_close} = $close;
-    my $p = $self->{period};
 
-    if (!$self->{_warmed_up}) {
-        # --- Fase warmup: acumular los primeros $period valores de TR ---
-        push @{ $self->{_tr_buffer} }, $tr;
+    push @{ $self->{_trs} }, $tr;
+    my $n = $self->{period};
 
-        if (scalar @{ $self->{_tr_buffer} } == $p) {
-            # Calcular la primera ATR como SMA de los TR acumulados
+    if (!$self->{_seeded}) {
+        if (scalar @{ $self->{_trs} } >= $n) {
+            # Seed = SMA de los primeros `period` TRs
             my $sum = 0;
-            $sum += $_ for @{ $self->{_tr_buffer} };
-            my $atr = $sum / $p;
+            $sum += $_ for @{ $self->{_trs} };
+            my $seed_atr = $sum / $n;
 
-            # Rellenar undef para las velas del warmup (sin ATR valido aun)
-            push @{ $self->{values} }, undef for (1 .. $p - 1);
-            push @{ $self->{values} }, $atr;
-            $self->{_warmed_up} = 1;
-            $self->{_last_atr}  = $atr;
+            $self->{_last_atr} = $seed_atr;
+            $self->{_seeded}   = 1;
+
+            # Rellenar undef para las velas anteriores al seed
+            my $total = scalar @{ $self->{_trs} };
+            while (scalar @{ $self->{values} } < $total - 1) {
+                push @{ $self->{values} }, undef;
+            }
+            push @{ $self->{values} }, $seed_atr;
+        } else {
+            push @{ $self->{values} }, undef;
         }
-        # Si aun no tenemos $period valores, no empujamos nada al array
-    }
-    else {
-        # --- Fase incremental: Wilder smoothing ---
-        my $prev_atr = $self->{_last_atr};
-        my $atr      = ($prev_atr * ($p - 1) + $tr) / $p;
-        push @{ $self->{values} }, $atr;
-        $self->{_last_atr} = $atr;
+    } else {
+        # Suavizado de Wilder
+        my $new_atr = ($self->{_last_atr} * ($n - 1) + $tr) / $n;
+        $self->{_last_atr} = $new_atr;
+        push @{ $self->{values} }, $new_atr;
     }
 }
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # get_values
-# Devuelve la referencia al array completo de valores ATR.
-# Los primeros ($period - 1) elementos son undef (sin dato suficiente).
-# El array tiene la misma longitud que el numero de velas procesadas.
-# Retorna: arrayref
-# ------------------------------------------------------------------------------
+# Devuelve arrayref completo de valores ATR (con undef en las primeras velas).
+# -----------------------------------------------------------------------------
 sub get_values {
     my ($self) = @_;
     return $self->{values};
 }
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # reset
-# Reinicia completamente el indicador (limpia todos los valores y estado).
-# Llamar antes de recalcular desde cero al cambiar de temporalidad.
-# ------------------------------------------------------------------------------
+# Reinicia el indicador (necesario al cambiar de timeframe).
+# -----------------------------------------------------------------------------
 sub reset {
     my ($self) = @_;
     $self->{values}      = [];
-    $self->{_tr_buffer}  = [];
+    $self->{_trs}        = [];
+    $self->{_seeded}     = 0;
+    $self->{_last_atr}   = undef;
     $self->{_prev_close} = undef;
-    $self->{_warmed_up}  = 0;
-    delete $self->{_last_atr};
 }
 
 1;
