@@ -1,528 +1,232 @@
-# ==============================================================================
+#!/usr/bin/perl
+
+# =============================================================================
 # market.pl
 # Punto de entrada del sistema de visualizacion de datos de mercado.
-# Clon funcional de TradingView usando Perl/Tk.
-# ==============================================================================
+# Carga datos OHLCV de un CSV, construye temporalidades (1m, 5m, 15m),
+# calcula indicadores (ATR), ensambla el motor de chart y arranca el GUI.
+#
+# Controles:
+#   Rueda                : zoom horizontal
+#   Ctrl + Rueda         : zoom vertical del panel bajo el mouse
+#   Drag boton 1         : scroll horizontal (tiempo)
+#   Click simple boton 1 : marca persistente (precio + hora)
+#   Doble clic boton 1   : borra marca persistente
+#   Drag boton derecho   : zoom/pan vertical del panel bajo el mouse
+#   Doble clic boton der : restaurar escala Y automatica
+#   Botones 1m/5m/15m    : cambio de temporalidad
+# =============================================================================
 
 use strict;
 use warnings;
+use lib '.';
 
-use lib '/home/wesdell/Documentos/trading_view_clone';
-
-use POSIX qw(mktime);
 use Tk;
-use Tk::Canvas;
+use Time::Moment;
 
 use Market::MarketData;
 use Market::IndicatorManager;
 use Market::Indicators::ATR;
+use Market::Panels::Scales;
+use Market::Panels::PricePanel;
+use Market::Panels::ATRPanel;
 use Market::ChartEngine;
 
-# ------------------------------------------------------------------------------
-# CONFIGURACION GENERAL
-# ------------------------------------------------------------------------------
+# =============================================================================
+# DIMENSIONES
+# =============================================================================
+my $WIN_W         = 1366;
+my $WIN_H         = 768;
+my $PRICE_SCALE_W = 90;
+my $TF_BAR_H      = 28;
+my $ATR_H         = 140;
+my $SEP_H         = 2;
+my $PRICE_H       = $WIN_H - $TF_BAR_H - $ATR_H - $SEP_H - 4;
+my $CANVAS_W      = $WIN_W;
 
-my $CANVAS_W     = 1400;
-my $PRICE_H      = 450;
-my $ATR_H        = 150;
-my $SCALE_W      = 75;
-my $VISIBLE_BARS = 200;
-my $INIT_TF      = 1;
+# =============================================================================
+# VENTANA
+# =============================================================================
+my $mw = MainWindow->new;
+$mw->title('Chart Test');
+$mw->geometry("${WIN_W}x${WIN_H}");
+$mw->resizable(0, 0);
+$mw->configure(-background => '#f1f3f6');
 
-my $CSV_FILE = '2026_03.csv';
+# Barra superior de temporalidades + zoom
+my $tf_frame = $mw->Frame(-background => '#f1f3f6', -height => $TF_BAR_H)
+    ->pack(-fill => 'x', -side => 'top');
 
-# ------------------------------------------------------------------------------
-# 1. LECTURA CSV
-# ------------------------------------------------------------------------------
+# Canvas principal de precios
+my $canvas_price = $mw->Canvas(
+    -width              => $CANVAS_W,
+    -height             => $PRICE_H,
+    -background         => '#ffffff',
+    -bd                 => 0,
+    -highlightthickness => 0,
+)->pack(-fill => 'x', -side => 'top');
+$canvas_price->configure(-scrollregion => [0, 0, $CANVAS_W, $PRICE_H]);
 
-print "Cargando datos desde: $CSV_FILE\n";
+# Separador entre paneles
+$mw->Frame(-background => '#c9cdd7', -height => $SEP_H)
+    ->pack(-fill => 'x', -side => 'top');
 
-my $market = Market::MarketData->new();
+# Canvas del indicador ATR
+my $canvas_atr = $mw->Canvas(
+    -width              => $CANVAS_W,
+    -height             => $ATR_H,
+    -background         => '#ffffff',
+    -bd                 => 0,
+    -highlightthickness => 0,
+)->pack(-fill => 'x', -side => 'top');
+$canvas_atr->configure(-scrollregion => [0, 0, $CANVAS_W, $ATR_H]);
 
-load_csv($CSV_FILE, $market);
+# =============================================================================
+# DATOS
+# =============================================================================
+print "Cargando datos...\n";
+my $market = Market::MarketData->new;
 
-printf "Velas 1m cargadas: %d\n", $market->size();
+# Busca el CSV en ubicaciones comunes
+my $csv_path;
+for my $cand ('data/2026_03.csv', '2026_03.csv', '../data/2026_03.csv') {
+    if (-f $cand) { $csv_path = $cand; last; }
+}
+die "No se encuentra 2026_03.csv (buscado en data/ y .)\n" unless $csv_path;
 
-# ------------------------------------------------------------------------------
-# 2. BUILD TIMEFRAMES
-# ------------------------------------------------------------------------------
+open my $fh, '<', $csv_path or die "Error abriendo CSV '$csv_path': $!\n";
+<$fh>;  # descartar header
+my $count = 0;
+while (<$fh>) {
+    chomp;
+    my ($time_str, $open, $high, $low, $close, $volume) = split /,/;
+    next unless defined $close && $close ne '';
 
-print "Construyendo temporalidades 5m y 15m...\n";
+    my $tm;
+    eval { $tm = Time::Moment->from_string($time_str) };
+    next if $@;
 
-$market->build_timeframes();
+    $market->add_candle({
+        time   => $time_str,
+        ts     => $tm->epoch,
+        open   => $open + 0,
+        high   => $high + 0,
+        low    => $low  + 0,
+        close  => $close + 0,
+        volume => $volume + 0,
+    });
+    $count++;
+}
+close $fh;
 
-$market->set_timeframe($INIT_TF);
+printf "Cargadas %d velas de 1m\n", $count;
+$market->build_timeframes;
+printf "5m: %d  |  15m: %d\n",
+    scalar @{ $market->get_data->{'5m'} },
+    scalar @{ $market->get_data->{'15m'} };
 
-# ------------------------------------------------------------------------------
-# 3. INDICADORES
-# ------------------------------------------------------------------------------
+# =============================================================================
+# INDICADORES
+# =============================================================================
+my $ind_manager = Market::IndicatorManager->new;
+$ind_manager->register('atr', Market::Indicators::ATR->new(14));
 
 print "Calculando ATR(14)...\n";
+$ind_manager->rebuild_all($market);
+printf "ATR listo: %d valores\n", scalar @{ $ind_manager->get('atr') };
 
-my $indicators =
-    Market::IndicatorManager->new();
-
-$indicators->register(
-    'ATR',
-    Market::Indicators::ATR->new(14)
+# =============================================================================
+# PANELES Y MOTOR
+# =============================================================================
+my $price_panel = Market::Panels::PricePanel->new(
+    canvas        => $canvas_price,
+    price_scale_w => $PRICE_SCALE_W,
 );
-
-my $n1m = $market->size();
-
-for (my $i = 0; $i < $n1m; $i++) {
-
-    my $c =
-        $market->get_candle($i);
-
-    my $fake =
-        bless { _c => $c }, '_FakeMD';
-
-    $indicators->update_last($fake);
-}
-
-printf(
-    "ATR calculado: %d valores\n",
-    scalar @{ $indicators->get('ATR') }
+my $atr_panel = Market::Panels::ATRPanel->new(
+    canvas        => $canvas_atr,
+    price_scale_w => $PRICE_SCALE_W,
 );
-
-# ------------------------------------------------------------------------------
-# 4. VENTANA PRINCIPAL
-# ------------------------------------------------------------------------------
-
-print "Iniciando interfaz grafica...\n";
-
-my $mw = MainWindow->new();
-
-$mw->title(
-    'Market Chart | 1m | NQ Futuros CME - Abril 2026'
-);
-
-$mw->configure(
-    -background => '#ffffff'
-);
-
-$mw->resizable(1, 1);
-
-$mw->geometry(
-    "${CANVAS_W}x" . ($PRICE_H + $ATR_H + 36)
-);
-
-# ------------------------------------------------------------------------------
-# FRAME PRINCIPAL
-# ------------------------------------------------------------------------------
-
-my $main_frame = $mw->Frame(
-    -background => '#ffffff'
-)->pack(
-    -fill   => 'both',
-    -expand => 1
-);
-
-# ------------------------------------------------------------------------------
-# TOOLBAR
-# ------------------------------------------------------------------------------
-
-my $toolbar = $main_frame->Frame(
-    -background => '#f8fafc',
-    -height     => 30,
-)->pack(
-    -side => 'top',
-    -fill => 'x'
-);
-
-# ------------------------------------------------------------------------------
-# BOTONES TIMEFRAME
-# ------------------------------------------------------------------------------
-
-my @tf_data = (
-    [1,  '1m'],
-    [5,  '5m'],
-    [15, '15m']
-);
-
-my @tf_buttons;
-
-for my $tf_entry (@tf_data) {
-
-    my ($tf, $label) = @$tf_entry;
-
-    my $btn = $toolbar->Button(
-
-        -text => $label,
-
-        -font => ['Helvetica', 10, 'bold'],
-
-        -background       => '#ffffff',
-        -foreground       => '#374151',
-
-        -activebackground => '#dbeafe',
-        -activeforeground => '#1d4ed8',
-
-        -relief => 'flat',
-
-        -padx => 12,
-        -pady => 4,
-
-        -command => sub {},
-
-    )->pack(
-        -side => 'left',
-        -padx => 2,
-        -pady => 3
-    );
-
-    push @tf_buttons, [$tf, $btn];
-}
-
-# ------------------------------------------------------------------------------
-# SEPARADOR
-# ------------------------------------------------------------------------------
-
-$toolbar->Label(
-
-    -text => '|',
-
-    -foreground => '#d1d5db',
-    -background => '#f8fafc',
-
-)->pack(
-    -side => 'left',
-    -padx => 4
-);
-
-# ------------------------------------------------------------------------------
-# BOTON RESET
-# ------------------------------------------------------------------------------
-
-my $reset_btn = $toolbar->Button(
-
-    -text => 'Reset',
-
-    -font => ['Helvetica', 9],
-
-    -background       => '#ffffff',
-    -foreground       => '#6b7280',
-
-    -activebackground => '#e5e7eb',
-    -activeforeground => '#111827',
-
-    -relief => 'flat',
-
-    -padx => 8,
-
-    -command => sub {},
-
-)->pack(
-    -side => 'left',
-    -padx => 2
-);
-
-# ------------------------------------------------------------------------------
-# LABEL AYUDA
-# ------------------------------------------------------------------------------
-
-$toolbar->Label(
-
-    -text =>
-'  Rueda=zoom  |  Drag=scroll  |  BtnDer=mover Y  |  DblClic=auto Y  |  1/5/F=temporalidad  |  R=reset',
-
-    -foreground => '#6b7280',
-    -background => '#f8fafc',
-
-    -font => ['Helvetica', 8],
-
-)->pack(
-    -side => 'right',
-    -padx => 8
-);
-
-# ------------------------------------------------------------------------------
-# FRAME CHART
-# ------------------------------------------------------------------------------
-
-my $chart_frame = $main_frame->Frame(
-    -background => '#ffffff'
-)->pack(
-    -fill   => 'both',
-    -expand => 1
-);
-
-# ------------------------------------------------------------------------------
-# PRICE CANVAS
-# ------------------------------------------------------------------------------
-
-my $price_canvas = $chart_frame->Canvas(
-
-    -width  => $CANVAS_W,
-    -height => $PRICE_H,
-
-    -background => '#ffffff',
-
-    -cursor => 'crosshair',
-
-    -borderwidth        => 0,
-    -highlightthickness => 0,
-
-)->pack(
-    -side   => 'top',
-    -fill   => 'both',
-    -expand => 1
-);
-
-# ------------------------------------------------------------------------------
-# SEPARADOR ENTRE PANELES
-# ------------------------------------------------------------------------------
-
-$chart_frame->Frame(
-
-    -background => '#e5e7eb',
-
-    -height => 1,
-
-)->pack(
-    -side => 'top',
-    -fill => 'x'
-);
-
-# ------------------------------------------------------------------------------
-# ATR CANVAS
-# ------------------------------------------------------------------------------
-
-my $atr_canvas = $chart_frame->Canvas(
-
-    -width  => $CANVAS_W,
-    -height => $ATR_H,
-
-    -background => '#ffffff',
-
-    -cursor => 'crosshair',
-
-    -borderwidth        => 0,
-    -highlightthickness => 0,
-
-)->pack(
-    -side => 'top',
-    -fill => 'x'
-);
-
-# ------------------------------------------------------------------------------
-# 5. CHART ENGINE
-# ------------------------------------------------------------------------------
 
 my $engine = Market::ChartEngine->new(
-
-    market       => $market,
-    indicators   => $indicators,
-
-    price_canvas => $price_canvas,
-    atr_canvas   => $atr_canvas,
-
-    canvas_w => $CANVAS_W,
-    price_h  => $PRICE_H,
-    atr_h    => $ATR_H,
-
-    scale_w => $SCALE_W,
-
-    visible_bars => $VISIBLE_BARS,
+    market         => $market,
+    indicators     => $ind_manager,
+    canvas_price   => $canvas_price,
+    canvas_atr     => $canvas_atr,
+    price_panel    => $price_panel,
+    atr_panel      => $atr_panel,
+    canvas_w       => $CANVAS_W,
+    canvas_price_h => $PRICE_H,
+    canvas_atr_h   => $ATR_H,
 );
 
-# ------------------------------------------------------------------------------
-# BOTONES TIMEFRAME
-# ------------------------------------------------------------------------------
+# =============================================================================
+# TOOLBAR (botones + selector de temporalidad)
+# =============================================================================
+my %bs = (
+    -background       => '#f1f3f6',
+    -foreground       => '#363a45',
+    -activebackground => '#dde0e8',
+    -activeforeground => '#131722',
+    -relief           => 'flat',
+    -bd               => 0,
+    -font             => 'TkDefaultFont 9',
+    -padx             => 5,
+    -pady             => 3,
+);
 
-for my $tf_entry (@tf_buttons) {
+$tf_frame->Label(%bs, -text => 'Zoom')
+    ->pack(-side => 'left', -padx => 6, -pady => 2);
 
-    my ($tf, $btn) = @$tf_entry;
+# Botones de zoom horizontal
+$tf_frame->Button(%bs, -text => '+',
+    -command => sub { $engine->_horizontal_zoom(-1) })
+    ->pack(-side => 'left', -padx => 1, -pady => 2);
+$tf_frame->Button(%bs, -text => '-',
+    -command => sub { $engine->_horizontal_zoom(1) })
+    ->pack(-side => 'left', -padx => 1, -pady => 2);
 
-    $btn->configure(
+$tf_frame->Frame(-background => '#c9cdd7', -width => 1, -height => 16)
+    ->pack(-side => 'left', -pady => 5, -padx => 6);
+
+# Etiqueta de temporalidad activa
+my $active_tf = '1m';
+my $tf_lbl = $tf_frame->Label(%bs,
+    -text       => '1m',
+    -foreground => '#2962ff',
+    -font       => 'TkDefaultFont 9 bold',
+)->pack(-side => 'left', -padx => 4, -pady => 2);
+
+# Botones de temporalidad
+my %tf_btns;
+for my $tf (qw(1m 5m 15m)) {
+    my $btn = $tf_frame->Button(%bs,
+        -text    => $tf,
+        -font    => 'TkDefaultFont 9 bold',
         -command => sub {
-
+            return if $active_tf eq $tf;
+            $active_tf = $tf;
+            $tf_lbl->configure(-text => $tf);
+            for my $k (keys %tf_btns) {
+                $tf_btns{$k}->configure(
+                    -foreground => ($k eq $tf ? '#2962ff' : '#363a45')
+                );
+            }
             $engine->set_timeframe($tf);
-
-            $mw->title(
-                "Market Chart | ${tf}m | NQ Futuros CME - Abril 2026"
-            );
-        }
-    );
+        },
+    )->pack(-side => 'left', -padx => 1, -pady => 2);
+    $tf_btns{$tf} = $btn;
 }
+$tf_btns{'1m'}->configure(-foreground => '#2962ff');
 
-# ------------------------------------------------------------------------------
-# BOTON RESET
-# ------------------------------------------------------------------------------
+$tf_frame->Label(%bs,
+    -text       => 'Rueda: zoom  |  Drag izq: scroll  |  Click izq: marca regleta  |  Drag der: zoom V  |  Dbl-clic der: auto',
+    -foreground => '#787b86',
+    -font       => 'TkDefaultFont 7',
+)->pack(-side => 'right', -padx => 10);
 
-$reset_btn->configure(
-    -command => sub {
-
-        $engine->reset_view();
-
-        $engine->render();
-    }
-);
-
-# ------------------------------------------------------------------------------
-# REDIMENSIONAMIENTO
-# ------------------------------------------------------------------------------
-
-$price_canvas->bind(
-    '<Configure>',
-    sub {
-
-        my $new_w =
-            $price_canvas->width();
-
-        my $new_h =
-            $price_canvas->height();
-
-        return
-            if $new_w < 100
-            || $new_h < 100;
-
-        $engine->{canvas_w} = $new_w;
-        $engine->{price_h}  = $new_h;
-
-        $engine->{price_panel}{canvas_w} = $new_w;
-        $engine->{price_panel}{canvas_h} = $new_h;
-
-        $engine->{atr_panel}{canvas_w} = $new_w;
-
-        $engine->request_render();
-    }
-);
-
-$atr_canvas->bind(
-    '<Configure>',
-    sub {
-
-        my $new_h =
-            $atr_canvas->height();
-
-        return
-            if $new_h < 30;
-
-        $engine->{atr_h} = $new_h;
-
-        $engine->{atr_panel}{canvas_h} = $new_h;
-
-        $engine->request_render();
-    }
-);
-
-# ------------------------------------------------------------------------------
-# 6. EVENTOS
-# ------------------------------------------------------------------------------
-
-$engine->bind_events();
-
-print "Dibujando chart inicial...\n";
-
-$engine->render();
-
-$price_canvas->focus();
-
-print "Sistema listo.\n";
-
-MainLoop();
-
-# ==============================================================================
-# SUBRUTINAS
-# ==============================================================================
-
-# ------------------------------------------------------------------------------
-# load_csv
-# ------------------------------------------------------------------------------
-
-sub load_csv {
-
-    my ($file, $md) = @_;
-
-    open(my $fh, '<', $file)
-        or die "No se puede abrir '$file': $!\n";
-
-    <$fh>;
-
-    while (my $line = <$fh>) {
-
-        chomp $line;
-
-        next unless $line =~ /\S/;
-
-        my (
-            $time,
-            $open,
-            $high,
-            $low,
-            $close,
-            $vol
-        ) = split /,/, $line;
-
-        $md->add_candle({
-
-            time       => $time,
-
-            time_epoch => iso_to_epoch($time),
-
-            open  => $open  + 0,
-            high  => $high  + 0,
-            low   => $low   + 0,
-            close => $close + 0,
-
-            volume => $vol + 0,
-        });
-    }
-
-    close $fh;
-}
-
-# ------------------------------------------------------------------------------
-# iso_to_epoch
-# ------------------------------------------------------------------------------
-
-sub iso_to_epoch {
-
-    my ($ts) = @_;
-
-    return 0
-        unless $ts =~ /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})([+-])(\d{2}):(\d{2})/;
-
-    my (
-        $yr,
-        $mo,
-        $dy,
-        $hr,
-        $mi,
-        $se,
-        $sign,
-        $oh,
-        $om
-    ) = (
-        $1,$2,$3,$4,$5,$6,$7,$8,$9
-    );
-
-    local $ENV{TZ} = 'UTC';
-
-    my $epoch =
-        mktime(
-            $se,
-            $mi,
-            $hr,
-            $dy,
-            $mo - 1,
-            $yr - 1900
-        );
-
-    my $offset =
-        ($oh * 3600 + $om * 60)
-        * ($sign eq '+' ? -1 : 1);
-
-    return $epoch + $offset;
-}
-
-# ------------------------------------------------------------------------------
-# _FakeMD
-# ------------------------------------------------------------------------------
-
-package _FakeMD;
-
-sub last_candle {
-    return $_[0]->{_c};
-}
+# =============================================================================
+# PRIMER RENDER
+# =============================================================================
+$engine->reset_view;
+$mw->after(80, sub { $engine->render });
+MainLoop;
