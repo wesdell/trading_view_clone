@@ -33,25 +33,43 @@ use Market::Panels::ATRPanel;
 use Market::ChartEngine;
 
 # =============================================================================
-# DIMENSIONES
+# VENTANA  (creamos primero para poder leer screenwidth/screenheight)
 # =============================================================================
-my $WIN_W         = 1366;
-my $WIN_H         = 768;
+my $mw = MainWindow->new;
+$mw->title('Chart Test');
+$mw->resizable(1, 1);
+$mw->configure(-background => '#f1f3f6');
+
+# --- Pantalla completa al iniciar -------------------------------------------
+# Intentamos primero el estado 'zoomed' (maximizado con bordes, que es lo que
+# usa TradingView). En X11/Linux tambien probamos el atributo -zoomed.
+# Como fallback, simplemente pedimos la geometria completa de la pantalla.
+eval { $mw->state('zoomed') };          # Windows / algunos WM de Linux
+eval { $mw->attributes('-zoomed', 1) }; # EWMH (KDE, GNOME, Xfwm...)
+$mw->update;   # deja que el WM procese la solicitud antes de leer el tamanio
+
+# =============================================================================
+# DIMENSIONES  (se leen despues de pedir maximizado para que sean correctas)
+# =============================================================================
+my $WIN_W         = $mw->screenwidth;
+my $WIN_H         = $mw->screenheight;
+
+# Si el WM no maximizo aun, forzamos la geometria a pantalla completa
+if ($mw->width < $WIN_W * 0.9) {
+    $mw->geometry("${WIN_W}x${WIN_H}+0+0");
+    $mw->update;
+}
+
+# Volvemos a leer las dimensiones reales post-maximizado
+$WIN_W = $mw->width  if $mw->width  > 100;
+$WIN_H = $mw->height if $mw->height > 100;
+
 my $PRICE_SCALE_W = 90;
 my $TF_BAR_H      = 28;
 my $ATR_H         = 140;
 my $SEP_H         = 2;
 my $PRICE_H       = $WIN_H - $TF_BAR_H - $ATR_H - $SEP_H - 4;
 my $CANVAS_W      = $WIN_W;
-
-# =============================================================================
-# VENTANA
-# =============================================================================
-my $mw = MainWindow->new;
-$mw->title('Chart Test');
-$mw->geometry("${WIN_W}x${WIN_H}");
-$mw->resizable(1, 1);
-$mw->configure(-background => '#f1f3f6');
 
 # Barra superior de temporalidades + zoom
 my $tf_frame = $mw->Frame(-background => '#f1f3f6', -height => $TF_BAR_H)
