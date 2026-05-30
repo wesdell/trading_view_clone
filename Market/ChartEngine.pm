@@ -65,7 +65,8 @@ sub new {
         # En modo auto (free=0) el zoom Y se recalcula solo.
         # En modo manual (free=1) drag izq mueve X e Y libremente,
         # y la rueda ancla al mouse en lugar del borde derecho.
-        _free_mode => 0,
+        _free_mode_price => 0,
+        _free_mode_atr   => 0,
     };
     bless $self, $class;
     $self->bind_events;
@@ -95,20 +96,26 @@ sub resize_panels {
 # toggle_free_mode
 # Devuelve 1 si quedo en modo manual, 0 si quedo en auto.
 # -----------------------------------------------------------------------------
-sub toggle_free_mode {
+sub toggle_free_mode_price {
     my ($self) = @_;
-    $self->{_free_mode} = $self->{_free_mode} ? 0 : 1;
+    $self->{_free_mode_price} = $self->{_free_mode_price} ? 0 : 1;
+    if ( !$self->{_free_mode_price} ) {
+        $self->{zoom_y_auto}   = 1;
+        $self->{y_range_price} = undef;
+        $self->request_render;
+    }
+    return $self->{_free_mode_price};
+}
 
-    if ( !$self->{_free_mode} ) {
-        # Volver a auto: resetear rangos Y
-        $self->{zoom_y_auto}     = 1;
-        $self->{y_range_price}   = undef;
+sub toggle_free_mode_atr {
+    my ($self) = @_;
+    $self->{_free_mode_atr} = $self->{_free_mode_atr} ? 0 : 1;
+    if ( !$self->{_free_mode_atr} ) {
         $self->{zoom_y_auto_atr} = 1;
         $self->{y_range_atr}     = undef;
         $self->request_render;
     }
-
-    return $self->{_free_mode};
+    return $self->{_free_mode_atr};
 }
 
 # -----------------------------------------------------------------------------
@@ -433,8 +440,8 @@ sub bind_events {
         $self->{_drag_moved}     = 0;
         $self->{_drag_panel}     = $panel;
 
-        # En modo manual inicializar y_range_price si no existe
-        if ( $self->{_free_mode} && $panel eq 'price'
+        # Modo manual precio: inicializar y_range_price si no existe
+        if ( $self->{_free_mode_price} && $panel eq 'price'
             && !$self->{y_range_price} && $self->{_scale_price} )
         {
             my ( $s, $e ) = $self->compute_window;
@@ -442,6 +449,17 @@ sub bind_events {
                 ->get_y_range( $self->{market}->get_slice( $s, $e ) );
             $self->{y_range_price} = [ $mn, $mx ];
             $self->{zoom_y_auto}   = 0;
+        }
+
+        # Modo manual ATR: inicializar y_range_atr si no existe
+        if ( $self->{_free_mode_atr} && $panel eq 'atr'
+            && !$self->{y_range_atr} && $self->{_scale_atr} )
+        {
+            my ( $s, $e ) = $self->compute_window;
+            my ( $mn, $mx ) = $self->{atr_panel}->get_y_range(
+                $self->{indicators}->slice_array( 'atr', $s, $e ) );
+            $self->{y_range_atr}     = [ $mn, $mx ];
+            $self->{zoom_y_auto_atr} = 0;
         }
     });
 
@@ -457,14 +475,13 @@ sub bind_events {
         }
 
         my $dx = $lx - ( $self->{_drag_start_x} // $lx );
-        # dy incremental: diferencia respecto al ultimo evento, no al inicio
         my $dy = $ly - ( $self->{_drag_start_y} // $ly );
 
         $self->{_drag_moved} = 1
             if abs($dx) > DRAG_THRESHOLD || abs($dy) > DRAG_THRESHOLD;
         return unless $self->{_drag_moved};
 
-        # --- Pan horizontal (siempre, en ambos modos) ---
+        # --- Pan horizontal (siempre) ---
         my $scale = $self->{_scale_price} // $self->{_scale_atr};
         if ( $scale && $self->{visible_bars} > 0 ) {
             my $bar_w = $scale->_plot_w / $self->{visible_bars};
@@ -474,54 +491,33 @@ sub bind_events {
             }
         }
 
-        # --- Pan vertical Y (solo modo manual, solo panel de precios) ---
-        if ( $self->{_free_mode} && $self->{_mouse_in_price}
+        # --- Pan vertical Y precio (modo manual, panel precios) ---
+        if ( $self->{_free_mode_price} && $self->{_mouse_in_price}
             && $self->{y_range_price} && abs($dy) > 0 )
         {
             my ( $mn, $mx ) = @{ $self->{y_range_price} };
             my $plot_h = $self->{canvas_price_h} - 10 - TIME_AXIS_H;
             if ( $plot_h > 0 ) {
-                # dy positivo = mouse baja = grafico sube = min/max suben
                 my $delta = $dy / $plot_h * ( $mx - $mn );
                 $self->{y_range_price} = [ $mn + $delta, $mx + $delta ];
             }
         }
 
-        # Actualizar referencias para el proximo evento
-        $self->{_drag_start_y} = $ly;   # incremental para pan Y
+        # --- Pan vertical Y ATR (modo manual, panel ATR) ---
+        if ( $self->{_free_mode_atr} && $self->{_mouse_in_atr}
+            && $self->{y_range_atr} && abs($dy) > 0 )
+        {
+            my ( $mn, $mx ) = @{ $self->{y_range_atr} };
+            my $plot_h = $self->{canvas_atr_h} - 6 - 14;  # padding_bot + padding_top
+            if ( $plot_h > 0 ) {
+                my $delta = $dy / $plot_h * ( $mx - $mn );
+                $self->{y_range_atr} = [ $mn + $delta, $mx + $delta ];
+            }
+        }
+
+        $self->{_drag_start_y} = $ly;
         $self->{_mouse_x}      = $lx;
         $self->request_render;
-    });
-
-    $toplevel->bind( '<ButtonRelease-1>', sub {
-        my $ev = $_[0]->XEvent;
-        my ( $panel, $lx, $ly ) = $hit_test->( $ev->X, $ev->Y );
-        return unless defined $panel;
-
-        my $dx = $lx - ( $self->{_drag_start_x} // $lx );
-        my $dy = $ly - ( $self->{_drag_start_y} // $ly );
-        # En modo manual no registramos marca al soltar (fue un pan)
-        return if $self->{_free_mode};
-        return if abs($dx) > DRAG_THRESHOLD || abs($dy) > DRAG_THRESHOLD;
-
-        if ( $panel eq 'price' && $self->{_scale_price} ) {
-            my $scale = $self->{_scale_price};
-            return if $lx > $scale->_plot_w;
-            return if $ly > $scale->{canvas_h} - $scale->{padding_bot};
-            $self->{_price_cross} = {
-                idx   => $scale->x_to_index($lx),
-                value => $scale->y_to_value($ly),
-            };
-            $self->_draw_price_cross;
-        } elsif ( $panel eq 'atr' && $self->{_scale_atr} ) {
-            my $scale = $self->{_scale_atr};
-            return if $lx > $scale->_plot_w;
-            $self->{_atr_cross} = {
-                idx   => $scale->x_to_index($lx) + $self->{offset},
-                value => $scale->y_to_value($ly),
-            };
-            $self->_draw_atr_cross;
-        }
     });
 
     # =========================================================================
@@ -886,8 +882,16 @@ sub _vertical_drag {
     my ( $mn, $mx ) = @{ $self->{y_range_price} };
     my $plot_h = $self->{canvas_price_h} - 10 - TIME_AXIS_H;
     return if $plot_h <= 0;
-    my $delta = $dy / $plot_h * ( $mx - $mn );
-    my ( $new_mn, $new_mx ) = $self->_clamp_price_range( $mn + $delta, $mx + $delta );
+
+    # dy negativo = mouse sube = zoom-in (rango se achica)
+    # dy positivo = mouse baja = zoom-out (rango se expande)
+    my $factor = 1.0 - ( $dy / $plot_h );
+    $factor = 0.05 if $factor < 0.05;
+    $factor = 5.0  if $factor > 5.0;
+
+    my $mid = ( $mn + $mx ) / 2;
+    my $half = ( $mx - $mn ) / 2 * $factor;
+    my ( $new_mn, $new_mx ) = $self->_clamp_price_range( $mid - $half, $mid + $half );
     $self->{y_range_price} = [ $new_mn, $new_mx ];
     $self->request_render;
 }
@@ -898,8 +902,16 @@ sub _vertical_drag_atr {
     my ( $mn, $mx ) = @{ $self->{y_range_atr} };
     my $plot_h = $self->{canvas_atr_h};
     return if $plot_h <= 0;
-    my $delta = $dy / $plot_h * ( $mx - $mn );
-    my ( $new_mn, $new_mx ) = $self->_clamp_atr_range( $mn + $delta, $mx + $delta );
+
+    # dy negativo = mouse sube = zoom-in
+    # dy positivo = mouse baja = zoom-out
+    my $factor = 1.0 - ( $dy / $plot_h );
+    $factor = 0.05 if $factor < 0.05;
+    $factor = 5.0  if $factor > 5.0;
+
+    my $mid = ( $mn + $mx ) / 2;
+    my $half = ( $mx - $mn ) / 2 * $factor;
+    my ( $new_mn, $new_mx ) = $self->_clamp_atr_range( $mid - $half, $mid + $half );
     $self->{y_range_atr} = [ $new_mn, $new_mx ];
     $self->request_render;
 }
@@ -971,7 +983,7 @@ sub _draw_crosshair_all {
             my $snap_idx = $self->{_scale_price}->x_to_index($x);
             # Modo manual o CTRL: pixel exacto sin snap
             # Modo auto: snap al centro de la vela
-            my $snap_x = ( $self->{_free_mode} || $self->{_ctrl_pressed} )
+            my $snap_x = ( $self->{_free_mode_price} || $self->{_ctrl_pressed} )
                 ? $x
                 : $self->{_scale_price}->index_to_center_x($snap_idx);
             $self->{price_panel}->draw_crosshair( $snap_x, $y, $candle_info );
@@ -992,7 +1004,7 @@ sub _draw_crosshair_all {
             $self->{atr_panel}->draw_crosshair( $snap_x, $y_atr );
         } elsif ( $self->{_mouse_in_price} || $self->{_ctrl_pressed} ) {
             my $snap_idx = $self->{_scale_atr}->x_to_index($x);
-            my $snap_x   = $self->{_free_mode}
+            my $snap_x   = $self->{_free_mode_atr}
                 ? $x
                 : $self->{_scale_atr}->index_to_center_x($snap_idx);
             $self->{atr_panel}->show_vline_only($snap_x);

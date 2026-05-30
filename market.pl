@@ -256,25 +256,33 @@ $tf_frame->Button(%bs, -text => '-',
 $tf_frame->Frame(-background => '#c9cdd7', -width => 1, -height => 16)
     ->pack(-side => 'left', -pady => 5, -padx => 6);
 
-# Boton modo Auto / Manual
+# Boton modo Auto / Manual  (panel de PRECIOS)
 my $mode_btn;
 $mode_btn = $tf_frame->Button(%bs,
-    -text       => 'Auto',
+    -text       => 'P:Auto',
     -foreground => '#26a69a',
     -font       => 'TkDefaultFont 9 bold',
     -command    => sub {
-        my $is_free = $engine->toggle_free_mode;
-        if ($is_free) {
-            $mode_btn->configure(
-                -text       => 'Manual',
-                -foreground => '#ef5350',
-            );
-        } else {
-            $mode_btn->configure(
-                -text       => 'Auto',
-                -foreground => '#26a69a',
-            );
-        }
+        my $is_free = $engine->toggle_free_mode_price;
+        $mode_btn->configure(
+            -text       => $is_free ? 'P:Manual' : 'P:Auto',
+            -foreground => $is_free ? '#ef5350'  : '#26a69a',
+        );
+    },
+)->pack(-side => 'left', -padx => 4, -pady => 2);
+
+# Boton modo Auto / Manual  (panel ATR)
+my $mode_btn_atr;
+$mode_btn_atr = $tf_frame->Button(%bs,
+    -text       => 'ATR:Auto',
+    -foreground => '#26a69a',
+    -font       => 'TkDefaultFont 9 bold',
+    -command    => sub {
+        my $is_free = $engine->toggle_free_mode_atr;
+        $mode_btn_atr->configure(
+            -text       => $is_free ? 'ATR:Manual' : 'ATR:Auto',
+            -foreground => $is_free ? '#ef5350'    : '#26a69a',
+        );
     },
 )->pack(-side => 'left', -padx => 4, -pady => 2);
 
