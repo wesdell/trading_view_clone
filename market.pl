@@ -7,7 +7,7 @@
 # calcula indicadores (ATR), ensambla el motor de chart y arranca el GUI.
 #
 # Controles:
-#   Rueda                : zoom horizontal
+#   Rueda                : zoom horizontal (ancla borde derecho)
 #   Ctrl + Rueda         : zoom vertical del panel bajo el mouse
 #   Drag boton 1         : scroll horizontal (tiempo)
 #   Click simple boton 1 : marca persistente (precio + hora)
@@ -41,26 +41,21 @@ $mw->resizable(1, 1);
 $mw->configure(-background => '#f1f3f6');
 
 # --- Pantalla completa al iniciar -------------------------------------------
-# Intentamos primero el estado 'zoomed' (maximizado con bordes, que es lo que
-# usa TradingView). En X11/Linux tambien probamos el atributo -zoomed.
-# Como fallback, simplemente pedimos la geometria completa de la pantalla.
 eval { $mw->state('zoomed') };          # Windows / algunos WM de Linux
 eval { $mw->attributes('-zoomed', 1) }; # EWMH (KDE, GNOME, Xfwm...)
-$mw->update;   # deja que el WM procese la solicitud antes de leer el tamanio
+$mw->update;
 
 # =============================================================================
-# DIMENSIONES  (se leen despues de pedir maximizado para que sean correctas)
+# DIMENSIONES
 # =============================================================================
 my $WIN_W         = $mw->screenwidth;
 my $WIN_H         = $mw->screenheight;
 
-# Si el WM no maximizo aun, forzamos la geometria a pantalla completa
 if ($mw->width < $WIN_W * 0.9) {
     $mw->geometry("${WIN_W}x${WIN_H}+0+0");
     $mw->update;
 }
 
-# Volvemos a leer las dimensiones reales post-maximizado
 $WIN_W = $mw->width  if $mw->width  > 100;
 $WIN_H = $mw->height if $mw->height > 100;
 
@@ -100,7 +95,6 @@ my $canvas_atr = $mw->Canvas(
 print "Cargando datos...\n";
 my $market = Market::MarketData->new;
 
-# Busca el CSV en ubicaciones comunes
 my $csv_path;
 for my $cand ('data/2026_03.csv', '2026_03.csv', '../data/2026_03.csv') {
     if (-f $cand) { $csv_path = $cand; last; }
@@ -190,12 +184,12 @@ my %bs = (
 $tf_frame->Label(%bs, -text => 'Zoom')
     ->pack(-side => 'left', -padx => 6, -pady => 2);
 
-# Botones de zoom horizontal
+# Botones de zoom horizontal (anclan siempre al borde derecho)
 $tf_frame->Button(%bs, -text => '+',
-    -command => sub { $engine->_horizontal_zoom(-1) })
+    -command => sub { $engine->_horizontal_zoom( -1, 0 ) })
     ->pack(-side => 'left', -padx => 1, -pady => 2);
 $tf_frame->Button(%bs, -text => '-',
-    -command => sub { $engine->_horizontal_zoom(1) })
+    -command => sub { $engine->_horizontal_zoom( 1, 0 ) })
     ->pack(-side => 'left', -padx => 1, -pady => 2);
 
 $tf_frame->Frame(-background => '#c9cdd7', -width => 1, -height => 16)
@@ -232,7 +226,7 @@ for my $tf (qw(1m 5m 15m)) {
 $tf_btns{'1m'}->configure(-foreground => '#2962ff');
 
 $tf_frame->Label(%bs,
-    -text       => 'Rueda: zoom  |  Drag izq: scroll  |  Click izq: marca regleta  |  Drag der: zoom V  |  Dbl-clic der: auto',
+    -text       => 'Rueda: zoom  |  Ctrl+Rueda: zoom ancla mouse  |  Shift+Rueda: zoom V  |  Drag izq: scroll  |  Click izq: marca regleta  |  Drag der: zoom V  |  Dbl-clic der: auto',
     -foreground => '#787b86',
     -font       => 'TkDefaultFont 7',
 )->pack(-side => 'right', -padx => 10);

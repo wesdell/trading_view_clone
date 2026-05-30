@@ -329,7 +329,7 @@ sub render {
 # Registra todos los eventos de mouse y teclado.
 #
 # Comportamiento:
-#   Rueda             -> zoom horizontal
+#   Rueda             -> zoom horizontal (ancla borde derecho)
 #   Ctrl + Rueda      -> zoom vertical del panel bajo el mouse
 #   Drag izq          -> scroll horizontal del grafico
 #   Click simple izq  -> marca precio/ATR en la regleta del panel clickeado
@@ -355,13 +355,6 @@ sub bind_events {
     # Recibe coordenadas ABSOLUTAS del root window ($ev->X / $ev->Y con
     # mayuscula, no minuscula) y devuelve qué panel esta bajo el mouse +
     # las coordenadas LOCALES del canvas correspondiente.
-    #
-    # Usamos coords del root porque son las unicas que son fiables al
-    # bindear en el toplevel: $ev->x/y con minuscula vienen relativas al
-    # widget que ORIGINALMENTE recibio el evento (que puede ser el canvas,
-    # el frame de la toolbar, el toplevel...), mientras que $ev->X/Y con
-    # mayuscula SIEMPRE son absolutas. Convertimos con $canvas->rootx/rooty
-    # para obtener el origen del canvas en root, restamos y listo.
     # =========================================================================
     my $hit_test = sub {
         my ( $abs_x, $abs_y ) = @_;
@@ -396,16 +389,23 @@ sub bind_events {
     # =========================================================================
     # RUEDA: zoom horizontal / vertical (Ctrl + rueda = zoom V)
     # =========================================================================
+   # =========================================================================
+    # RUEDA sola      -> zoom horizontal, ancla borde derecho
+    # CTRL  + Rueda   -> zoom horizontal, ancla vela bajo el mouse
+    # Shift + Rueda   -> zoom vertical del panel bajo el mouse
+    # =========================================================================
     $toplevel->bind(
         '<Button-4>',
         sub {
             my $state = $_[0]->XEvent->s;
-            if ( $state & 4 ) {
+            my $ctrl  = ( $state & 4  ) ? 1 : 0;   # bit 2 = Control
+            my $shift = ( $state & 1  ) ? 1 : 0;   # bit 0 = Shift
+            if ($shift) {
                 $self->_vertical_zoom_price(0.9) if $self->{_mouse_in_price};
                 $self->_vertical_zoom_atr(0.9)   if $self->{_mouse_in_atr};
             }
             else {
-                $self->_horizontal_zoom(-1);
+                $self->_horizontal_zoom( -1, $ctrl );
             }
             Tk->break;
         }
@@ -414,12 +414,14 @@ sub bind_events {
         '<Button-5>',
         sub {
             my $state = $_[0]->XEvent->s;
-            if ( $state & 4 ) {
+            my $ctrl  = ( $state & 4  ) ? 1 : 0;
+            my $shift = ( $state & 1  ) ? 1 : 0;
+            if ($shift) {
                 $self->_vertical_zoom_price(1.1) if $self->{_mouse_in_price};
                 $self->_vertical_zoom_atr(1.1)   if $self->{_mouse_in_atr};
             }
             else {
-                $self->_horizontal_zoom(1);
+                $self->_horizontal_zoom( 1, $ctrl );
             }
             Tk->break;
         }
@@ -685,21 +687,34 @@ sub bind_events {
 
 # -----------------------------------------------------------------------------
 # _horizontal_zoom
-# $dir -1 = acercar (menos velas), +1 = alejar (mas velas).
-# Centra el zoom en el punto medio actual.
+# $dir  : -1 = acercar (menos velas), +1 = alejar (mas velas).
+# $ctrl : 0 = anclar ultima vela visible (borde derecho).
+#         1 = anclar vela bajo el mouse (requiere _mouse_x valido).
 # -----------------------------------------------------------------------------
 sub _horizontal_zoom {
-    my ( $self, $dir ) = @_;
+    my ( $self, $dir, $ctrl ) = @_;
     my $old = $self->{visible_bars};
     my $new = ( $dir > 0 ) ? int( $old * 1.15 ) : int( $old / 1.15 );
     $new = MIN_BARS if $new < MIN_BARS;
     $new = MAX_BARS if $new > MAX_BARS;
     return if $new == $old;
 
-    my $center = $self->{offset} + int( $old / 2 );
-    $self->{visible_bars} = $new;
-    $self->{offset}       = $center - int( $new / 2 );
-    $self->{offset}       = 0 if $self->{offset} < 0;
+    if ( $ctrl && $self->{_scale_price} && $self->{_mouse_x} >= 0 ) {
+        # CTRL: anclar la vela bajo el mouse preservando su posicion relativa
+        my $anchor = $self->{_scale_price}->x_to_index( $self->{_mouse_x} );
+        my $frac   = $self->{_mouse_x} / $self->{_scale_price}->_plot_w;
+        $frac = 0 if $frac < 0;
+        $frac = 1 if $frac > 1;
+        $self->{visible_bars} = $new;
+        $self->{offset}       = $anchor - int( $frac * $new );
+    }
+    else {
+        # Sin CTRL: anclar la ultima vela visible (borde derecho del grafico)
+        my $anchor = $self->{offset} + $old - 1;
+        $self->{visible_bars} = $new;
+        $self->{offset}       = $anchor - ( $new - 1 );
+    }
+
     $self->request_render;
 }
 
@@ -1176,19 +1191,6 @@ sub reset_view {
 # compute_intraday_labels
 # Genera etiquetas para el eje X adaptadas al zoom, comenzando desde la
 # hora exacta de la primera vela visible.
-#
-# Algoritmo de deteccion por transicion de slot:
-#   1. Detectar duracion de la vela activa (tf_minutes).
-#   2. Elegir un paso "bonito" en minutos segun el zoom.
-#   3. Iterar velas visibles. Para cada vela se calcula su "slot"
-#      (= floor(hora_local_en_minutos / step_min)).
-#   4. Cuando el slot cambia respecto a la vela anterior, se coloca un tick
-#      con la etiqueta del INICIO del nuevo slot (tiempo redondeado bonito).
-#      Esto funciona aunque las velas no esten alineadas al reloj UTC, ya que
-#      se usa el string de tiempo local de la vela, no el epoch.
-#   5. Primera vela visible: siempre se coloca un tick con su hora exacta
-#      (ancla de inicio que pide el profesor).
-#   6. Cambios de dia: etiqueta "DowName DD" en lugar de hora.
 # -----------------------------------------------------------------------------
 sub compute_intraday_labels {
     my ( $self, $start, $end ) = @_;
@@ -1196,16 +1198,10 @@ sub compute_intraday_labels {
     my $visible = $end - $start + 1;
     return [] if $visible <= 0;
 
-    # ------------------------------------------------------------------
-    # 1. Duracion de vela en minutos segun el timeframe activo
-    # ------------------------------------------------------------------
     my %tf_min = ( '1m' => 1, '5m' => 5, '15m' => 15 );
     my $tf      = $self->{market}->get_timeframe;
     my $bar_min = $tf_min{$tf} // 1;
 
-    # ------------------------------------------------------------------
-    # 2. Paso de tiempo "bonito": el menor que da <= 12 etiquetas visibles
-    # ------------------------------------------------------------------
     my @nice    = ( 1, 2, 5, 10, 15, 20, 30, 60, 120, 240, 360, 720, 1440 );
     my $step_min = $nice[-1];
     for my $s (@nice) {
@@ -1216,9 +1212,6 @@ sub compute_intraday_labels {
         }
     }
 
-    # ------------------------------------------------------------------
-    # 3. Parametros anti-colision
-    # ------------------------------------------------------------------
     my $min_gap = int( $step_min / $bar_min / 2 );
     $min_gap = 1 if $min_gap < 1;
 
@@ -1229,15 +1222,10 @@ sub compute_intraday_labels {
     my $last_day        = -1;
     my $first_bar       = 1;
 
-    # ------------------------------------------------------------------
-    # 4. Iterar velas visibles
-    # ------------------------------------------------------------------
     for my $i ( $start .. $end ) {
         my $c = $self->{market}->get_candle($i);
         next unless $c;
 
-        # Leer hora/min del string de tiempo local de la vela
-        # (inmune a desalineacion de epoch causada por gaps intraday)
         next
           unless defined $c->{time}
           && $c->{time} =~ /\d{4}-\d{2}-(\d{2})T(\d{2}):(\d{2})/;
@@ -1245,9 +1233,6 @@ sub compute_intraday_labels {
         my ( $mday, $hour, $min ) = ( $1 + 0, $2 + 0, $3 + 0 );
         my $cur_slot = int( ( $hour * 60 + $min ) / $step_min );
 
-        # -----------------------------------------------------------------
-        # Primera vela visible: ancla de inicio con la hora exacta
-        # -----------------------------------------------------------------
         if ($first_bar) {
             my $label = sprintf( '%d:%02d', $hour, $min );
             push @result,
@@ -1262,24 +1247,18 @@ sub compute_intraday_labels {
         my $day_change  = ( $mday != $last_day );
         my $slot_change = ( $cur_slot != $last_slot );
 
-        # Actualizar estado SIEMPRE (cada transicion dispara una sola vez)
         $last_day  = $mday;
         $last_slot = $cur_slot;
 
         next unless $day_change || $slot_change;
         next if $i - $last_placed_idx < $min_gap;
 
-        # -----------------------------------------------------------------
-        # Construir etiqueta
-        # -----------------------------------------------------------------
         my $label;
         if ($day_change) {
-            # Cambio de dia: "Mon 27"
             my $wday = ( gmtime( $c->{ts} ) )[6];
             $label = $DAY_ABBR[$wday] . ' ' . $mday;
         }
         else {
-            # Mismo dia: mostrar el inicio del slot (tiempo redondeado)
             my $slot_h = int( $cur_slot * $step_min / 60 );
             my $slot_m = ( $cur_slot * $step_min ) % 60;
             $label = sprintf( '%d:%02d', $slot_h, $slot_m );
