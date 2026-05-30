@@ -99,7 +99,18 @@ sub resize_panels {
 sub toggle_free_mode_price {
     my ($self) = @_;
     $self->{_free_mode_price} = $self->{_free_mode_price} ? 0 : 1;
-    if ( !$self->{_free_mode_price} ) {
+
+    if ( $self->{_free_mode_price} ) {
+        # Al entrar en manual: capturar rango Y actual si no existe
+        if ( !$self->{y_range_price} && $self->{_scale_price} ) {
+            my ( $s, $e ) = $self->compute_window;
+            my ( $mn, $mx ) = $self->{price_panel}
+                ->get_y_range( $self->{market}->get_slice( $s, $e ) );
+            $self->{y_range_price} = [ $mn, $mx ];
+        }
+        $self->{zoom_y_auto} = 0;
+    } else {
+        # Al volver a auto: resetear
         $self->{zoom_y_auto}   = 1;
         $self->{y_range_price} = undef;
         $self->request_render;
@@ -110,7 +121,18 @@ sub toggle_free_mode_price {
 sub toggle_free_mode_atr {
     my ($self) = @_;
     $self->{_free_mode_atr} = $self->{_free_mode_atr} ? 0 : 1;
-    if ( !$self->{_free_mode_atr} ) {
+
+    if ( $self->{_free_mode_atr} ) {
+        # Al entrar en manual: capturar rango Y actual si no existe
+        if ( !$self->{y_range_atr} && $self->{_scale_atr} ) {
+            my ( $s, $e ) = $self->compute_window;
+            my ( $mn, $mx ) = $self->{atr_panel}->get_y_range(
+                $self->{indicators}->slice_array( 'atr', $s, $e ) );
+            $self->{y_range_atr} = [ $mn, $mx ];
+        }
+        $self->{zoom_y_auto_atr} = 0;
+    } else {
+        # Al volver a auto: resetear
         $self->{zoom_y_auto_atr} = 1;
         $self->{y_range_atr}     = undef;
         $self->request_render;
@@ -196,11 +218,14 @@ sub render {
     my $visible_candles = $self->{market}->get_slice( $safe_start, $safe_end );
     my $visible_atr     = $self->{indicators}->slice_array( 'atr', $start, $end );
 
+    # --- Rango Y precios ---
     my ( $min_p, $max_p );
-    if ( $self->{zoom_y_auto} ) {
+    if ( $self->{zoom_y_auto} && !$self->{_free_mode_price} ) {
         ( $min_p, $max_p ) = $self->{price_panel}->get_y_range($visible_candles);
-    } else {
+    } elsif ( $self->{y_range_price} ) {
         ( $min_p, $max_p ) = @{ $self->{y_range_price} };
+    } else {
+        ( $min_p, $max_p ) = $self->{price_panel}->get_y_range($visible_candles);
     }
     my $last_visible = $visible_candles->[-1];
 
@@ -220,12 +245,16 @@ sub render {
     $self->{price_panel}->set_scale($scale_price);
     $self->{_scale_price} = $scale_price;
 
+   # --- Rango Y ATR ---
     my ( $min_a, $max_a );
-    if ( $self->{zoom_y_auto_atr} ) {
+    if ( $self->{zoom_y_auto_atr} && !$self->{_free_mode_atr} ) {
         ( $min_a, $max_a ) = $self->{atr_panel}->get_y_range($visible_atr);
-    } else {
+    } elsif ( $self->{y_range_atr} ) {
         ( $min_a, $max_a ) = @{ $self->{y_range_atr} };
+    } else {
+        ( $min_a, $max_a ) = $self->{atr_panel}->get_y_range($visible_atr);
     }
+
     my $last_atr_val;
     for my $v ( reverse @$visible_atr ) {
         if ( defined $v ) { $last_atr_val = $v; last; }
