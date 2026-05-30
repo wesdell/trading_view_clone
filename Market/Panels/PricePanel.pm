@@ -593,12 +593,13 @@ sub draw_time_axis {
             -tags => ['time_axis']
         );
 
-        # Etiqueta
+        # Etiqueta: negrita si es cambio de dia, normal si es hora
+        my $font = $anchor->{is_day} ? 'TkFixedFont 7 bold' : 'TkFixedFont 7';
         $canvas->createText(
             $x, $y_text + 4,
             -text   => $anchor->{label},
             -fill   => '#787b86',
-            -font   => 'TkFixedFont 7',
+            -font   => $font,
             -anchor => 'n',
             -tags   => ['time_axis']
         );

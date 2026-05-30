@@ -1110,7 +1110,7 @@ sub compute_intraday_labels {
                 ( $cur_slot * $step_min ) % 60 );
         }
 
-        push @result, { index => $i, label => $label, ts => $c->{ts} };
+        push @result, { index => $i, label => $label, ts => $c->{ts}, is_day => $day_change };
         $last_placed_idx = $i;
     }
 
