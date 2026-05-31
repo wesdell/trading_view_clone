@@ -95,17 +95,27 @@ sub get_y_range {
     my ($self, $values) = @_;
     return (0, 1) unless $values && @$values;
 
-    my $max;
+    my ($min, $max);
     for my $v (@$values) {
         next unless defined $v;
+        $min = $v if !defined $min || $v < $min;
         $max = $v if !defined $max || $v > $max;
     }
     return (0, 1) unless defined $max;
 
-    my $mg = $max * 0.10;
+    # Margen minimo para que la linea no toque literalmente el borde del plot.
+    # Usamos 2% del rango (o del max si min==max) en lugar del 10% fijo sobre
+    # el maximo, asi la curva usa casi toda la altura disponible.
+    my $range = $max - $min;
+    $range = $max * 0.02 if $range < 1e-9;  # proteccion valores casi iguales
+    my $mg = $range * 0.02;
     $mg = 0.0001 if $mg < 0.0001;
 
-    return (0, $max + $mg);
+    # El piso nunca baja de 0 (ATR >= 0 por definicion)
+    my $floor = $min - $mg;
+    $floor = 0 if $floor < 0;
+
+    return ($floor, $max + $mg);
 }
 
 # -----------------------------------------------------------------------------
