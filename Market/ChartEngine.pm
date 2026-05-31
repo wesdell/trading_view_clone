@@ -362,6 +362,23 @@ sub bind_events {
     }
 
     # =========================================================================
+    # FOCUSOUT / FocusOut a nivel toplevel:
+    # Si el usuario hace Alt+Tab o cambia de ventana mientras CTRL esta
+    # presionado, el KeyRelease nunca llega y el crosshair queda congelado.
+    # Reseteamos _ctrl_pressed al perder el foco para evitar ese bloqueo.
+    # =========================================================================
+    $toplevel->bind( '<FocusOut>', sub {
+        if ( $self->{_ctrl_pressed} ) {
+            $self->{_ctrl_pressed}    = 0;
+            $self->{_zoom_anchor_idx} = undef;
+            $self->{_zoom_anchor_px}  = undef;
+        }
+        # Tambien forzamos un redibujado del crosshair para que no quede
+        # el _crosshair_pending atascado en 1 por una llamada after huerfana.
+        $self->{_crosshair_pending} = 0;
+    });
+
+    # =========================================================================
     # RUEDA
     # Modo auto  + sin CTRL : ancla borde derecho
     # Modo auto  + CTRL     : ancla vela bajo el mouse (congelada)
@@ -420,7 +437,8 @@ sub bind_events {
     # =========================================================================
     # MOTION
     # En modo manual NO congelamos el mouse — el crosshair sigue al cursor.
-    # En modo CTRL si lo congelamos.
+    # En modo CTRL el anchor de zoom se congela pero el crosshair se sigue
+    # moviendo (igual que TradingView).
     # =========================================================================
     $toplevel->bind( '<Motion>', sub {
         my $ev = $_[0]->XEvent;
@@ -435,9 +453,6 @@ sub bind_events {
             }
             return;
         }
-
-        # Solo CTRL congela el crosshair; el modo manual NO lo congela
-        return if $self->{_ctrl_pressed};
 
         if ( $panel eq 'price' ) {
             $self->{_mouse_in_price} = 1;
