@@ -311,7 +311,6 @@ sub render {
     my $anchors = $self->compute_intraday_labels( $start, $end );
     $self->{price_panel}->draw_time_axis( $self->{canvas_price}, $anchors );
     $self->{price_panel}->_init_crosshair_objects;
-    $self->_draw_price_cross;
 
     $self->{canvas_atr}->delete('atr_all');
     $self->{canvas_atr}->delete('scale_bg');
@@ -322,7 +321,6 @@ sub render {
     $self->{atr_panel}->render( $self->{canvas_atr}, $visible_atr, $scale_atr );
     $self->{atr_panel}->render_last_visible_value( $self->{canvas_atr} );
     $self->{atr_panel}->_init_crosshair;
-    $self->_draw_atr_cross;
 
     $self->_draw_crosshair_all;
 }
@@ -663,24 +661,6 @@ sub bind_events {
         return if $self->{_free_mode_atr}   && $panel eq 'atr';
         return if abs($dx) > DRAG_THRESHOLD || abs($dy) > DRAG_THRESHOLD;
 
-        if ( $panel eq 'price' && $self->{_scale_price} ) {
-            my $scale = $self->{_scale_price};
-            return if $lx > $scale->_plot_w;
-            return if $ly > $scale->{canvas_h} - $scale->{padding_bot};
-            $self->{_price_cross} = {
-                idx   => $scale->x_to_index($lx),
-                value => $scale->y_to_value($ly),
-            };
-            $self->_draw_price_cross;
-        } elsif ( $panel eq 'atr' && $self->{_scale_atr} ) {
-            my $scale = $self->{_scale_atr};
-            return if $lx > $scale->_plot_w;
-            $self->{_atr_cross} = {
-                idx   => $scale->x_to_index($lx) + $self->{offset},
-                value => $scale->y_to_value($ly),
-            };
-            $self->_draw_atr_cross;
-        }
     });
 
     # =========================================================================
@@ -942,110 +922,8 @@ sub _clamp_atr_range {
     return ( $new_mn, $new_mx );
 }
 
-# -----------------------------------------------------------------------------
-# _draw_price_cross
-# -----------------------------------------------------------------------------
-sub _draw_price_cross {
-    my ($self) = @_;
-    my $cross  = $self->{_price_cross};
-    my $canvas = $self->{canvas_price};
-    my $scale  = $self->{_scale_price};
 
-    $canvas->delete('price_cross');
-    return unless defined $cross && $scale;
 
-    my $color = '#2962ff';
-    my $x     = $scale->index_to_center_x( $cross->{idx} );
-    my $y     = $scale->value_to_y( $cross->{value} );
-    my $x_sep = $scale->_plot_w;
-    my $x_end = $scale->{canvas_w};
-    my $y_sep = $scale->{canvas_h} - $scale->{padding_bot};
-
-    my $idx_in_view = (
-        $cross->{idx} >= $scale->{offset}
-        && $cross->{idx} < $scale->{offset} + $scale->{visible_bars}
-        && $x >= 0 && $x <= $x_sep
-    );
-
-    if ($idx_in_view) {
-        $canvas->createLine( $x, 0, $x, $y_sep,
-            -fill => $color, -dash => [4,3], -width => 1,
-            -tags => ['price_cross'] );
-    }
-
-    if ( $scale->value_in_range( $cross->{value} ) ) {
-        $canvas->createLine( 0, $y, $x_sep, $y,
-            -fill => $color, -dash => [4,3], -width => 1,
-            -tags => ['price_cross'] );
-        $canvas->createRectangle( $x_sep+1, $y-9, $x_end-1, $y+9,
-            -fill => $color, -outline => $color, -tags => ['price_cross'] );
-        $canvas->createText( $x_sep + ($x_end-$x_sep)/2, $y,
-            -text => sprintf('%.2f', $cross->{value}), -fill => '#ffffff',
-            -anchor => 'center', -font => 'TkFixedFont 8 bold',
-            -tags => ['price_cross'] );
-    }
-
-    if ($idx_in_view) {
-        my $candle = $self->{market}->get_candle( $cross->{idx} );
-        if ($candle) {
-            my $time_lbl = _format_time_for_axis( $candle->{time} );
-            my $w = length($time_lbl) * 5 + 12;
-            $canvas->createRectangle( $x-$w/2, $y_sep+1, $x+$w/2, $y_sep+17,
-                -fill => $color, -outline => $color, -tags => ['price_cross'] );
-            $canvas->createText( $x, $y_sep+9,
-                -text => $time_lbl, -fill => '#ffffff',
-                -anchor => 'center', -font => 'TkFixedFont 8 bold',
-                -tags => ['price_cross'] );
-        }
-    }
-
-    $canvas->raise('price_cross');
-}
-
-# -----------------------------------------------------------------------------
-# _draw_atr_cross
-# -----------------------------------------------------------------------------
-sub _draw_atr_cross {
-    my ($self) = @_;
-    my $cross  = $self->{_atr_cross};
-    my $canvas = $self->{canvas_atr};
-    my $scale  = $self->{_scale_atr};
-
-    $canvas->delete('atr_cross');
-    return unless defined $cross && $scale;
-
-    my $color   = '#b71c1c';
-    my $rel_idx = $cross->{idx} - $self->{offset};
-    my $x       = $scale->index_to_center_x($rel_idx);
-    my $y       = $scale->value_to_y( $cross->{value} );
-    my $x_sep   = $scale->_plot_w;
-    my $x_end   = $scale->{canvas_w};
-
-    my $idx_in_view = (
-        $rel_idx >= 0 && $rel_idx < $scale->{visible_bars}
-        && $x >= 0 && $x <= $x_sep
-    );
-
-    if ($idx_in_view) {
-        $canvas->createLine( $x, 0, $x, $scale->{canvas_h},
-            -fill => $color, -dash => [4,3], -width => 1,
-            -tags => ['atr_cross'] );
-    }
-
-    if ( $scale->value_in_range( $cross->{value} ) ) {
-        $canvas->createLine( 0, $y, $x_sep, $y,
-            -fill => $color, -dash => [4,3], -width => 1,
-            -tags => ['atr_cross'] );
-        $canvas->createRectangle( $x_sep+1, $y-9, $x_end-1, $y+9,
-            -fill => $color, -outline => $color, -tags => ['atr_cross'] );
-        $canvas->createText( $x_sep + ($x_end-$x_sep)/2, $y,
-            -text => sprintf('%.4f', $cross->{value}), -fill => '#ffffff',
-            -anchor => 'center', -font => 'TkFixedFont 8 bold',
-            -tags => ['atr_cross'] );
-    }
-
-    $canvas->raise('atr_cross');
-}
 
 sub _format_time_for_axis {
     my ($iso) = @_;
