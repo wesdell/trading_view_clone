@@ -940,7 +940,6 @@ sub _clamp_atr_range {
     return ( $new_mn, $new_mx );
 }
 
-
 sub _format_time_for_axis {
     my ($iso) = @_;
     return '' unless defined $iso;
@@ -1052,7 +1051,12 @@ sub _draw_crosshair_all {
             my $snap_idx = $self->{_scale_price}->x_to_index($x);
             my $snap_x   = $self->{_scale_price}->index_to_center_x($snap_idx);
             $self->{price_panel}->show_vline_only($snap_x);
-            $self->{price_panel}->show_ohlcv_info($candle_info) if $candle_info;
+            
+            # --- MODIFICACION: Dibuja la fecha inferior cuando el mouse esta en el ATR ---
+            if ($candle_info) {
+                $self->{price_panel}->show_ohlcv_info($candle_info);
+                $self->{price_panel}->draw_time_label($snap_x, $candle_info);
+            }
         } else {
             $self->{price_panel}->hide_crosshair;
         }
@@ -1081,7 +1085,6 @@ sub set_timeframe {
     $self->{indicators}->reset_all;
     $self->{indicators}->rebuild_all( $self->{market} );
 
-    # Resetear modos manuales al cambiar temporalidad
     $self->{_free_mode_price} = 0;
     $self->{_free_mode_atr}   = 0;
     $self->{zoom_y_auto}      = 1;
