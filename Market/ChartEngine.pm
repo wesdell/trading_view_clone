@@ -251,13 +251,13 @@ sub render {
     }
     my $last_visible = $visible_candles->[-1];
 
+    # Escala de Precio (SIN visual_offset)
     my $scale_price = Market::Panels::Scales->new(
         canvas_w      => $canv_w,
         canvas_h      => $canv_ph,
         price_scale_w => PRICE_SCALE_W,
         visible_bars  => $self->{visible_bars},
         offset        => $start,
-        visual_offset => ($start < 0 ? abs($start) : 0),
         min_val       => $min_p,
         max_val       => $max_p,
         padding_top   => 10,
@@ -280,13 +280,13 @@ sub render {
         if ( defined $v ) { $last_atr_val = $v; last; }
     }
 
+    # Escala de ATR (SIN visual_offset)
     my $scale_atr = Market::Panels::Scales->new(
         canvas_w      => $canv_w,
         canvas_h      => $canv_ah,
         price_scale_w => PRICE_SCALE_W,
         visible_bars  => $self->{visible_bars},
-        offset        => 0,
-        visual_offset => ($start < 0 ? abs($start) : 0),
+        offset        => $start,
         min_val       => $min_a,
         max_val       => $max_a,
         padding_top   => 14,
@@ -939,8 +939,6 @@ sub _clamp_atr_range {
     }
     return ( $new_mn, $new_mx );
 }
-
-
 
 
 sub _format_time_for_axis {

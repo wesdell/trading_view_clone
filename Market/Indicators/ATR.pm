@@ -2,16 +2,12 @@ package Market::Indicators::ATR;
 
 # =============================================================================
 # Market::Indicators::ATR
-# Average True Range (Wilder) - mismo metodo que TradingView.
+# Average True Range (Wilder)
 #
-# True Range:
-#   TR = max( H-L,  |H - Close_prev|,  |L - Close_prev| )
-#
-# Suavizado de Wilder:
-#   ATR seed  = SMA de los primeros `period` TRs
-#   ATR(t)    = ( ATR(t-1) * (period-1) + TR(t) ) / period
-#
-# Las primeras (period-1) velas tienen ATR = undef (no calculado todavia).
+# Modificado para rellenar el inicio:
+# Las primeras (period-1) velas calculan un promedio progresivo (SMA)
+# para que la linea nazca exactamente en la vela 0 sin dejar huecos.
+# A partir de la vela `period`, se aplica el suavizado original de Wilder.
 # =============================================================================
 
 use strict;
@@ -28,7 +24,7 @@ sub new {
         period      => $period,
         values      => [],       # ATR calculado por vela (paralelo a candles)
         _trs        => [],       # True Ranges acumulados (fase seed)
-        _seeded     => 0,        # 1 cuando ya se calculo el seed
+        _seeded     => 0,        # 1 cuando ya se calculo el seed completo
         _last_atr   => undef,    # ATR de la vela anterior (para Wilder)
         _prev_close => undef,    # close de la vela anterior (para TR)
     };
@@ -60,7 +56,7 @@ sub update_at_index {
 
 # -----------------------------------------------------------------------------
 # _process_candle  (privado)
-# Calcula el TR de la vela y actualiza el ATR aplicando seed o Wilder.
+# Calcula el TR de la vela y actualiza el ATR.
 # -----------------------------------------------------------------------------
 sub _process_candle {
     my ($self, $c) = @_;
@@ -86,28 +82,23 @@ sub _process_candle {
 
     push @{ $self->{_trs} }, $tr;
     my $n = $self->{period};
+    my $count = scalar @{ $self->{_trs} };
 
     if (!$self->{_seeded}) {
-        if (scalar @{ $self->{_trs} } >= $n) {
-            # Seed = SMA de los primeros `period` TRs
-            my $sum = 0;
-            $sum += $_ for @{ $self->{_trs} };
-            my $seed_atr = $sum / $n;
+        # Promedio Simple Progresivo para rellenar los primeros espacios
+        my $sum = 0;
+        $sum += $_ for @{ $self->{_trs} };
+        my $current_atr = $sum / $count;
 
-            $self->{_last_atr} = $seed_atr;
-            $self->{_seeded}   = 1;
+        $self->{_last_atr} = $current_atr;
+        push @{ $self->{values} }, $current_atr;
 
-            # Rellenar undef para las velas anteriores al seed
-            my $total = scalar @{ $self->{_trs} };
-            while (scalar @{ $self->{values} } < $total - 1) {
-                push @{ $self->{values} }, undef;
-            }
-            push @{ $self->{values} }, $seed_atr;
-        } else {
-            push @{ $self->{values} }, undef;
+        # Cuando llegamos a la cantidad del periodo (ej. 14), activamos el suavizado de Wilder
+        if ($count >= $n) {
+            $self->{_seeded} = 1;
         }
     } else {
-        # Suavizado de Wilder
+        # Suavizado de Wilder original
         my $new_atr = ($self->{_last_atr} * ($n - 1) + $tr) / $n;
         $self->{_last_atr} = $new_atr;
         push @{ $self->{values} }, $new_atr;
@@ -116,7 +107,7 @@ sub _process_candle {
 
 # -----------------------------------------------------------------------------
 # get_values
-# Devuelve arrayref completo de valores ATR (con undef en las primeras velas).
+# Devuelve arrayref completo de valores ATR.
 # -----------------------------------------------------------------------------
 sub get_values {
     my ($self) = @_;

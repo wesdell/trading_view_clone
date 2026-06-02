@@ -1,35 +1,15 @@
 package Market::Panels::ATRPanel;
 
-# =============================================================================
-# Market::Panels::ATRPanel
-# Panel inferior: linea continua del indicador ATR + regleta Y propia.
-#
-# Coordenadas:
-#   visible_atr es un slice RELATIVO (i=0 = primera barra visible).
-#   scale se construye con offset=0 y visible_bars = len(visible_atr).
-#   Asi x = index_to_center_x(i) coincide con el panel de precios.
-#
-# Color: linea rojo bordo #b71c1c, grosor 1.5px.
-# =============================================================================
-
 use strict;
 use warnings;
 
-# ------------------------------------------------------------------------------
-# Paleta clara estilo TradingView Light
-# ------------------------------------------------------------------------------
-
 use constant {
-    COLOR_ATR      => '#ff2121',   # color de la linea del ATR
-    COLOR_ATR_LAST => '#c65300',   # color de la caja del ultimo valor
+    COLOR_ATR      => '#ff2121',
+    COLOR_ATR_LAST => '#c65300',
     COLOR_CROSS    => '#9598a1',
     BG_COLOR       => '#ffffff',
 };
 
-# ------------------------------------------------------------------------------
-# new
-# Inicializa el panel ATR.
-# ------------------------------------------------------------------------------
 sub new {
     my ($class, %args) = @_;
 
@@ -48,10 +28,6 @@ sub new {
     return $self;
 }
 
-# -----------------------------------------------------------------------------
-# _init_crosshair
-# Crea los items del crosshair UNA SOLA VEZ.
-# -----------------------------------------------------------------------------
 sub _init_crosshair {
     my ($self) = @_;
 
@@ -85,12 +61,6 @@ sub _init_crosshair {
     $self->{_cross_ready} = 1;
 }
 
-# -----------------------------------------------------------------------------
-# get_y_range
-# Min/Max del ATR visible. ATR siempre >= 0.
-# Margen del 10% sobre el max para que la linea no toque el borde superior.
-# El piso es 0 (mejor visualizacion de la base).
-# -----------------------------------------------------------------------------
 sub get_y_range {
     my ($self, $values) = @_;
     return (0, 1) unless $values && @$values;
@@ -103,52 +73,33 @@ sub get_y_range {
     }
     return (0, 1) unless defined $max;
 
-    # Margen minimo para que la linea no toque literalmente el borde del plot.
-    # Usamos 2% del rango (o del max si min==max) en lugar del 10% fijo sobre
-    # el maximo, asi la curva usa casi toda la altura disponible.
     my $range = $max - $min;
-    $range = $max * 0.02 if $range < 1e-9;  # proteccion valores casi iguales
+    $range = $max * 0.02 if $range < 1e-9;
     my $mg = $range * 0.02;
     $mg = 0.0001 if $mg < 0.0001;
 
-    # El piso nunca baja de 0 (ATR >= 0 por definicion)
     my $floor = $min - $mg;
     $floor = 0 if $floor < 0;
 
     return ($floor, $max + $mg);
 }
 
-# -----------------------------------------------------------------------------
-# set_scale
-# -----------------------------------------------------------------------------
 sub set_scale {
     my ($self, $scale) = @_;
-
     $self->{scale} = $scale;
 }
 
-# -----------------------------------------------------------------------------
-# render
-# Dibuja fondo + escala + linea ATR. Maneja gaps (undef) y valores fuera
-# del rango Y (se interrumpe el segmento al salir del rango).
-#
-# $values: arrayref relativo (i=0 = primera barra visible).
-# $scale : con offset=0, visible_bars = scalar(@$values).
-# -----------------------------------------------------------------------------
 sub render {
     my ($self, $canvas, $values, $scale) = @_;
     return unless $values && @$values;
 
     $canvas->delete('atr_all');
 
-    # Fondo blanco
     $canvas->createRectangle(0, 0, $scale->{canvas_w}, $scale->{canvas_h},
         -fill => BG_COLOR, -outline => BG_COLOR, -tags => ['atr_all']);
 
-    # Escala Y (grilla + etiquetas)
     $scale->_draw_y_scale($canvas);
 
-    # Etiqueta del nombre del indicador (arriba izquierda)
     $canvas->createText(8, 4,
         -text   => 'ATR(14)',
         -fill   => COLOR_ATR,
@@ -157,16 +108,20 @@ sub render {
         -tags   => ['atr_all'],
     );
 
-    # Construir segmentos: cada gap (undef) o valor fuera de rango
-    # interrumpe la linea (estilo TradingView).
     my @seg;
     my $n = scalar @$values;
+    
+    # INDICE ABSOLUTO CORREGIDO:
+    my $start_idx = $scale->{offset} < 0 ? 0 : $scale->{offset};
 
     for my $i (0 .. $n - 1) {
-        my $v = $values->[$i];
-        if (defined $v && $scale->value_in_range($v)) {
-            my $x = $scale->index_to_center_x($i);
-            my $y = $scale->value_to_y($v);
+        my $v   = $values->[$i];
+        my $idx = $i + $start_idx; 
+        
+        if (defined $v) {
+            my $x = $scale->index_to_center_x($idx);
+            # Utilizamos _raw en vez de _to_y para permitir a Tk recortar fuera del eje
+            my $y = $scale->value_to_y_raw($v); 
             push @seg, $x, $y;
         } else {
             if (@seg >= 4) {
@@ -188,11 +143,6 @@ sub render {
     }
 }
 
-# -----------------------------------------------------------------------------
-# render_last_visible_value
-# Linea horizontal + caja con el ultimo valor visible del ATR.
-# Solo se dibuja si esta dentro del rango visible.
-# -----------------------------------------------------------------------------
 sub render_last_visible_value {
     my ($self, $canvas) = @_;
     return unless $self->{scale};
@@ -217,11 +167,6 @@ sub render_last_visible_value {
         -tags   => ['atr_all']);
 }
 
-# -----------------------------------------------------------------------------
-# show_vline_only
-# Muestra SOLO la linea vertical del crosshair (sincronizacion con el
-# panel de precios cuando el cursor esta arriba).
-# -----------------------------------------------------------------------------
 sub show_vline_only {
     my ($self, $x) = @_;
     my $c     = $self->{canvas};
@@ -245,10 +190,6 @@ sub show_vline_only {
     $c->raise('crosshair_atr');
 }
 
-# -----------------------------------------------------------------------------
-# hide_crosshair
-# Oculta TODO el crosshair de este panel.
-# -----------------------------------------------------------------------------
 sub hide_crosshair {
     my ($self) = @_;
     my $c = $self->{canvas};
@@ -256,10 +197,6 @@ sub hide_crosshair {
     $c->itemconfigure('crosshair_atr', -state => 'hidden');
 }
 
-# -----------------------------------------------------------------------------
-# draw_crosshair
-# Mueve los items del crosshair a la posicion (x, y) usando coords().
-# -----------------------------------------------------------------------------
 sub draw_crosshair {
     my ($self, $x, $y) = @_;
     my $c     = $self->{canvas};
