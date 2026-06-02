@@ -118,7 +118,6 @@ sub render {
     $body_w = 1 if $body_w < 1;
     my $thin = ( $bar_w < 3 ) ? 1 : 0;
 
-    # INDICE ABSOLUTO CORREGIDO:
     my $start_idx = $scale->{offset} < 0 ? 0 : $scale->{offset};
 
     for my $i ( 0 .. $#$data ) {
@@ -278,7 +277,6 @@ sub draw_time_label {
     my @days = qw(Sun Mon Tue Wed Thu Fri Sat);
 
     if ( $time =~ /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/ ) {
-
         my ( $year, $month, $day, $hour, $min ) = ( $1, $2, $3, $4, $5 );
         require Time::Local;
 
@@ -318,6 +316,11 @@ sub hide_crosshair {
     $c->itemconfigure( 'time_label',      -state => 'hidden' );
 }
 
+# -----------------------------------------------------------------------------
+# draw_crosshair
+# FIX: Etiqueta de precio ajustada y forzada matemáticamente a múltiplos
+# de 0.25 (Tick Size de mercado). La línea horizontal también se sincroniza.
+# -----------------------------------------------------------------------------
 sub draw_crosshair {
     my ( $self, $x, $y, $candle_info ) = @_;
     my $c     = $self->{canvas};
@@ -334,24 +337,33 @@ sub draw_crosshair {
         return;
     }
 
+    # Snap de la línea vertical a la vela
     my $idx    = $scale->x_to_index($x);
     my $snap_x = $scale->index_to_center_x($idx);
 
     $c->coords( $self->{_ch_vline}, $snap_x, 0, $snap_x, $h );
     $c->itemconfigure( $self->{_ch_vline}, -state => 'normal' );
 
-    $c->coords( $self->{_ch_hline}, 0, $y, $x_sep, $y );
+    # SNAP MATEMÁTICO: Redondeo del precio al múltiplo de 0.25 más cercano
+    my $raw_price     = $scale->y_to_value($y);
+    my $snapped_price = floor( $raw_price * 4 + 0.5 ) / 4;
+    
+    # Recalcular la coordenada Y exacta basándose en el precio redondeado
+    my $snap_y = $scale->value_to_y($snapped_price);
+
+    # Línea horizontal forzada a moverse de a saltos ("ticks")
+    $c->coords( $self->{_ch_hline}, 0, $snap_y, $x_sep, $snap_y );
     $c->itemconfigure( $self->{_ch_hline}, -state => 'normal' );
 
-    my $price = $scale->y_to_value($y);
+    # Dibujar la etiqueta y su fondo sobre la coordenada anclada
     my $lbl_x = $x_sep + 1;
     my $lbl_w = $x_end - $x_sep - 2;
-    $c->coords( $self->{_ch_label_bg}, $lbl_x, $y - 9, $lbl_x + $lbl_w, $y + 9 );
+    $c->coords( $self->{_ch_label_bg}, $lbl_x, $snap_y - 9, $lbl_x + $lbl_w, $snap_y + 9 );
     $c->itemconfigure( $self->{_ch_label_bg}, -state => 'normal' );
-    $c->coords( $self->{_ch_label}, $lbl_x + $lbl_w / 2, $y );
+    $c->coords( $self->{_ch_label}, $lbl_x + $lbl_w / 2, $snap_y );
     $c->itemconfigure(
         $self->{_ch_label},
-        -text  => sprintf( '%.2f', $price ),
+        -text  => sprintf( '%.2f', $snapped_price ),
         -state => 'normal'
     );
 
