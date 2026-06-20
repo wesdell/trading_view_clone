@@ -1185,7 +1185,7 @@ sub compute_intraday_labels {
 
         my $label;
         if ($day_change) {
-            my $wday = ( gmtime( $c->{ts} ) )[6];
+            my $wday = ( gmtime( $c->{ts} + 5*3600 ) )[6];
             $label = $DAY_ABBR[$wday] . ' ' . $mday;
         } else {
             $label = sprintf( '%d:%02d',

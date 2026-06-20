@@ -259,10 +259,8 @@ sub show_ohlcv_info {
 
 sub draw_time_label {
     my ( $self, $snap_x, $candle_info ) = @_;
-
     my $c     = $self->{canvas};
     my $scale = $self->{scale};
-
     return unless $c && $scale;
     return unless $candle_info;
 
@@ -273,25 +271,23 @@ sub draw_time_label {
         '05' => 'May', '06' => 'Jun', '07' => 'Jul', '08' => 'Aug',
         '09' => 'Sep', '10' => 'Oct', '11' => 'Nov', '12' => 'Dec',
     );
-
     my @days = qw(Sun Mon Tue Wed Thu Fri Sat);
 
     if ( $time =~ /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/ ) {
-        my ( $year, $month, $day, $hour, $min ) = ( $1, $2, $3, $4, $5 );
-        require Time::Local;
+        my ( $year, $month, $day, $hour, $min ) = ( $1, $2, $3, $4+0, $5+0 );
 
-        my $epoch = Time::Local::timelocal( 0, $min, $hour, $day, $month - 1, $year );
-        my $wday = ( localtime($epoch) )[6];
+        my $ts   = $candle_info->{ts} // 0;
+        my $wday = ( gmtime( $ts + 5*3600 ) )[6];
 
         my $dow = $days[$wday];
         my $mon = $months{$month} // $month;
         my $yy  = substr( $year, 2, 2 );
 
-        $hour += 0;
-        $time = sprintf( '%s %d %s %s %d:%02d', $dow, $day, $mon, $yy, $hour, $min );
+        $time = sprintf( '%s %d %s %s %d:%02d',
+            $dow, $day+0, $mon, $yy, $hour, $min );
     }
 
-    my $y = $scale->{canvas_h} - 10;
+    my $y     = $scale->{canvas_h} - 10;
     my $pad_x = 6;
     my $pad_y = 3;
 
@@ -302,7 +298,9 @@ sub draw_time_label {
     return unless @bbox;
 
     my ( $x1, $y1, $x2, $y2 ) = @bbox;
-    $c->coords( $self->{_time_label_bg}, $x1 - $pad_x, $y1 - $pad_y, $x2 + $pad_x, $y2 + $pad_y );
+    $c->coords( $self->{_time_label_bg},
+        $x1 - $pad_x, $y1 - $pad_y,
+        $x2 + $pad_x, $y2 + $pad_y );
     $c->itemconfigure( $self->{_time_label_bg}, -state => 'normal' );
     $c->raise('time_label');
 }

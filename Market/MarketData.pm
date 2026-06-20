@@ -49,33 +49,21 @@ sub add_candle {
 # -----------------------------------------------------------------------------
 sub build_tf_candles {
     my ($self, $tf) = @_;
-
     my %minutes = ('5m' => 5, '15m' => 15);
     my $n = $minutes{$tf} or return;
     my $interval_sec = $n * 60;
-
     my $src = $self->{data}{'1m'};
     my @result;
     my $current_candle = undef;
 
     for my $c (@$src) {
-        # Ancla matematica del Epoch al bloque de tiempo exacto
         my $bucket_ts = int($c->{ts} / $interval_sec) * $interval_sec;
 
         if (!defined $current_candle || $current_candle->{ts} != $bucket_ts) {
-            # Si ya teniamos una vela construyendose, la guardamos
             push @result, $current_candle if defined $current_candle;
 
-            # Construimos la nueva etiqueta de tiempo perfecta
-            my $tm = Time::Moment->from_epoch($bucket_ts);
-            my $time_str = sprintf(
-                "%04d-%02d-%02dT%02d:%02d:00",
-                $tm->year, $tm->month, $tm->day_of_month, $tm->hour, $tm->minute
-            );
-
-            # Inicializamos la nueva vela anclada
             $current_candle = {
-                time   => $time_str,
+                time   => $c->{time},  # FIX: heredar time de la 1ra vela 1m del bucket
                 ts     => $bucket_ts,
                 open   => $c->{open},
                 high   => $c->{high},
@@ -84,17 +72,14 @@ sub build_tf_candles {
                 volume => $c->{volume},
             };
         } else {
-            # Actualizamos la vela en curso
-            $current_candle->{high}  = $c->{high} if $c->{high} > $current_candle->{high};
-            $current_candle->{low}   = $c->{low}  if $c->{low}  < $current_candle->{low};
-            $current_candle->{close} = $c->{close};
+            $current_candle->{high}   = $c->{high}   if $c->{high}  > $current_candle->{high};
+            $current_candle->{low}    = $c->{low}    if $c->{low}   < $current_candle->{low};
+            $current_candle->{close}  = $c->{close};
             $current_candle->{volume} += $c->{volume};
         }
     }
-    
-    # Guardar la ultima vela que quedo en el buffer
-    push @result, $current_candle if defined $current_candle;
 
+    push @result, $current_candle if defined $current_candle;
     $self->{data}{$tf} = \@result;
 }
 
