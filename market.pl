@@ -20,6 +20,12 @@ use Market::OverlayManager;
 use Market::Overlays::DemoOverlay;
 use Market::Replay;
 
+# --- Fase 2: motores analiticos y overlays SMC / Liquidez (Tabla 1) ---
+use Market::Indicators::Liquidity;
+use Market::Indicators::SMC_Structures;
+use Market::Overlays::SMC_Structures;
+use Market::Overlays::Liquidity;
+
 # =============================================================================
 # VENTANA
 # =============================================================================
@@ -126,23 +132,39 @@ printf "5m: %d  |  15m: %d\n",
 # INDICADORES
 # =============================================================================
 my $ind_manager = Market::IndicatorManager->new;
-$ind_manager->register('atr', Market::Indicators::ATR->new(14));
-print "Calculando ATR(14)...\n";
+
+# El ORDEN de registro importa: en cada vela, rebuild/update procesa los
+# indicadores en este orden. Liquidity necesita el ATR ya calculado (tolerancia
+# EQH/EQL) y SMC_Structures necesita los swings ya confirmados por Liquidity.
+my $atr_ind = Market::Indicators::ATR->new(14);
+my $liq_ind = Market::Indicators::Liquidity->new( atr => $atr_ind, k => 3 );
+my $smc_ind = Market::Indicators::SMC_Structures->new(
+    liquidity => $liq_ind, max_age => 50 );
+
+$ind_manager->register('atr',       $atr_ind);
+$ind_manager->register('liquidity', $liq_ind);
+$ind_manager->register('smc',       $smc_ind);
+
+print "Calculando indicadores (ATR, Liquidity, SMC)...\n";
 $ind_manager->rebuild_all($market);
-printf "ATR listo: %d valores\n", scalar @{ $ind_manager->get('atr') };
+printf "ATR: %d  |  swings: %d  |  eventos liq: %d  |  FVGs: %d\n",
+    scalar @{ $ind_manager->get('atr') },
+    scalar @{ $liq_ind->get_swings },
+    scalar @{ $liq_ind->get_events },
+    scalar @{ $smc_ind->get_fvgs };
 
 # =============================================================================
-# OVERLAYS — gestor + overlay de validacion (Etapa 2, Fase 2)
-# El overlay 'demo' es temporal: solo confirma que la arquitectura de
-# Overlays funciona (registro, render sincronizado con scroll/zoom,
-# toggle de visibilidad) antes de implementar Liquidity.pm en la Etapa 8.
-# Se debe quitar (o sustituir su registro por el de Liquidity) mas adelante.
+# OVERLAYS — gestor + overlays reales SMC y Liquidez (Tabla 1, Fase 2)
+# Cada overlay solo DIBUJA estructuras ya calculadas por su indicador fuente
+# (separacion estricta calculo/render). Nacen OCULTOS: el usuario decide que
+# activar de forma independiente desde el menu de herramientas.
 # =============================================================================
 my $overlay_mgr = Market::OverlayManager->new;
-$overlay_mgr->register('demo', Market::Overlays::DemoOverlay->new(
-    price        => $market->last_candle->{close},  # nivel de precio = ultimo close real del CSV
-    marker_index => $market->size - 50,              # cae dentro de la ventana inicial (ultimas 120 velas)
-));
+my $smc_overlay = Market::Overlays::SMC_Structures->new(
+    source => $smc_ind, max_age => 50 );
+my $liq_overlay = Market::Overlays::Liquidity->new( source => $liq_ind );
+$overlay_mgr->register('smc',       $smc_overlay, visible => 0);
+$overlay_mgr->register('liquidity', $liq_overlay, visible => 0);
 
 # =============================================================================
 # PANELES Y MOTOR
@@ -241,24 +263,6 @@ $tf_frame->Button(%bs, -text => '+',
 $tf_frame->Button(%bs, -text => '-',
     -command => sub { $engine->_horizontal_zoom(1, 0) })
     ->pack(-side => 'left', -padx => 1, -pady => 2);
-
-$tf_frame->Frame(-background => '#c9cdd7', -width => 1, -height => 16)
-    ->pack(-side => 'left', -pady => 5, -padx => 6);
-
-# --- Checkbutton de visibilidad de overlays (Etapa 2) ---
-my $demo_overlay_visible = 1;
-$tf_frame->Checkbutton(
-    -text       => 'Demo Overlay',
-    -variable   => \$demo_overlay_visible,
-    -onvalue    => 1,
-    -offvalue   => 0,
-    -background => '#f1f3f6',
-    -font       => 'TkDefaultFont 9',
-    -command    => sub {
-        $overlay_mgr->set_visible('demo', $demo_overlay_visible);
-        $engine->request_render;
-    },
-)->pack(-side => 'left', -padx => 4, -pady => 2);
 
 $tf_frame->Frame(-background => '#c9cdd7', -width => 1, -height => 16)
     ->pack(-side => 'left', -pady => 5, -padx => 6);
@@ -482,6 +486,140 @@ $replay_status_lbl = $replay_frame->Label(%bs,
         );
     });
 }
+
+# =============================================================================
+# MENU DE HERRAMIENTAS / OVERLAYS (Fase 2)
+# Cada herramienta tiene su PROPIO estado de activacion: marcar una opcion
+# NUNCA activa las demas. La visibilidad de un overlay completo = (alguna de
+# sus sub-opciones activa). El menu SOLO administra estados y dispara render;
+# no calcula ni dibuja directamente.
+# =============================================================================
+my $BAR_BG   = '#eef1f5';
+my $PANEL_BG = '#f7f8fa';
+
+my %BBS = (
+    -background       => $BAR_BG,
+    -activebackground => '#dde0e8',
+    -foreground       => '#363a45',
+    -relief           => 'flat',
+    -bd               => 0,
+    -font             => 'TkDefaultFont 9',
+    -padx             => 5,
+    -pady             => 2,
+);
+
+# --- Fila "Herramientas:" con el toggle del panel ---
+my $tools_bar = $mw->Frame(-background => $BAR_BG);
+$tools_bar->pack(-side => 'top', -fill => 'x', -before => $canvas_price);
+$tools_bar->Label(-text => 'Herramientas:', -background => $BAR_BG,
+    -foreground => '#363a45', -font => 'TkDefaultFont 9 bold')
+    ->pack(-side => 'left', -padx => 8, -pady => 3);
+
+# --- Panel colapsable con las columnas de checkbuttons ---
+# Nace COLAPSADO: la app arranca limpia, sin overlays activos ni panel abierto.
+my $tools_panel = $mw->Frame(-background => $PANEL_BG);
+
+my $panel_shown = 0;
+my $panel_btn;
+$panel_btn = $tools_bar->Button(%BBS,
+    -text => 'Overlays [>]', -foreground => '#2962ff',
+    -font => 'TkDefaultFont 9 bold',
+    -command => sub {
+        $panel_shown = !$panel_shown;
+        if ($panel_shown) {
+            $tools_panel->pack(-side=>'top', -fill=>'x', -before=>$canvas_price);
+            $panel_btn->configure(-text => 'Overlays [v]');
+        } else {
+            $tools_panel->packForget;
+            $panel_btn->configure(-text => 'Overlays [>]');
+        }
+    },
+)->pack(-side => 'left', -padx => 4, -pady => 2);
+$tools_bar->Label(-text => 'Clic en cada herramienta para activar/desactivar de forma independiente',
+    -background => $BAR_BG, -foreground => '#787b86', -font => 'TkDefaultFont 8')
+    ->pack(-side => 'right', -padx => 10);
+
+# --- Helpers de construccion del menu ---
+my $make_col = sub {
+    my ($title, $color) = @_;
+    my $col = $tools_panel->Frame(-background => $PANEL_BG);
+    $col->pack(-side => 'left', -anchor => 'n', -padx => 14, -pady => 6);
+    $col->Label(-text => $title, -background => $PANEL_BG, -foreground => $color,
+        -font => 'TkDefaultFont 9 bold')->pack(-side => 'top', -anchor => 'w');
+    return $col;
+};
+my $make_chk = sub {
+    my ($parent, $text, $varref, $cmd, $disabled) = @_;
+    my $cb = $parent->Checkbutton(
+        -text => $text, -variable => $varref, -onvalue => 1, -offvalue => 0,
+        -background => $PANEL_BG, -activebackground => $PANEL_BG,
+        -font => 'TkDefaultFont 8', -anchor => 'w',
+        ( $cmd ? ( -command => $cmd ) : () ),
+    );
+    $cb->configure(-state => 'disabled') if $disabled;
+    $cb->pack(-side => 'top', -anchor => 'w', -fill => 'x');
+    return $cb;
+};
+
+# =============================================================================
+# Columna SMC STRUCTURES (BOS / CHoCH / FVG)
+# =============================================================================
+my %SMC = ( show_fvg => 0, show_bos => 0, show_choch => 0 );
+my $smc_master = 0;
+my $refresh_smc = sub {
+    $smc_overlay->set_flag($_, $SMC{$_}) for keys %SMC;
+    my $any = ( $SMC{show_fvg} || $SMC{show_bos} || $SMC{show_choch} ) ? 1 : 0;
+    $overlay_mgr->set_visible('smc', $any);
+    $engine->request_render;
+};
+my $sync_smc_master = sub {
+    $smc_master =
+        ( $SMC{show_fvg} && $SMC{show_bos} && $SMC{show_choch} ) ? 1 : 0;
+};
+my $leaf_smc = sub { $refresh_smc->(); $sync_smc_master->(); };
+
+my $col_smc = $make_col->('SMC Structures', '#2962ff');
+$make_chk->($col_smc, 'Activar SMC', \$smc_master, sub {
+    $SMC{$_} = $smc_master for keys %SMC;   # master = encender/apagar TODO SMC
+    $refresh_smc->();
+});
+$make_chk->($col_smc, 'BOS',       \$SMC{show_bos},   $leaf_smc);
+$make_chk->($col_smc, 'CHoCH',     \$SMC{show_choch}, $leaf_smc);
+$make_chk->($col_smc, 'FVG',       \$SMC{show_fvg},   $leaf_smc);
+
+# =============================================================================
+# Columna LIQUIDITY (Swing / BSL / SSL / EQH / EQL / Sweeps / Grabs / Runs)
+# =============================================================================
+my %LIQ = (
+    show_swing => 0, show_bsl => 0, show_ssl => 0, show_eqh => 0,
+    show_eql => 0, show_sweeps => 0, show_grabs => 0, show_runs => 0,
+);
+my $liq_master = 0;
+my $refresh_liq = sub {
+    $liq_overlay->set_flag($_, $LIQ{$_}) for keys %LIQ;
+    my $any = 0; $any ||= $LIQ{$_} for keys %LIQ;
+    $overlay_mgr->set_visible('liquidity', $any ? 1 : 0);
+    $engine->request_render;
+};
+my $sync_liq_master = sub {
+    my $all = 1; $all &&= $LIQ{$_} for keys %LIQ;
+    $liq_master = $all ? 1 : 0;
+};
+my $leaf_liq = sub { $refresh_liq->(); $sync_liq_master->(); };
+
+my $col_liq = $make_col->('Liquidity', '#ef5350');
+$make_chk->($col_liq, 'Activar Liquidity', \$liq_master, sub {
+    $LIQ{$_} = $liq_master for keys %LIQ;
+    $refresh_liq->();
+});
+$make_chk->($col_liq, 'Swing Points',  \$LIQ{show_swing},  $leaf_liq);
+$make_chk->($col_liq, 'BSL - Buy Side',  \$LIQ{show_bsl},  $leaf_liq);
+$make_chk->($col_liq, 'SSL - Sell Side', \$LIQ{show_ssl},  $leaf_liq);
+$make_chk->($col_liq, 'EQH',     \$LIQ{show_eqh},    $leaf_liq);
+$make_chk->($col_liq, 'EQL',     \$LIQ{show_eql},    $leaf_liq);
+$make_chk->($col_liq, 'Sweeps',  \$LIQ{show_sweeps}, $leaf_liq);
+$make_chk->($col_liq, 'Grabs',   \$LIQ{show_grabs},  $leaf_liq);
+$make_chk->($col_liq, 'Runs',    \$LIQ{show_runs},   $leaf_liq);
 
 # =============================================================================
 # PRIMER RENDER

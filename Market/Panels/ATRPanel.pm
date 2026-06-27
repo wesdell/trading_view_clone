@@ -111,8 +111,10 @@ sub render {
     my @seg;
     my $n = scalar @$values;
     
-    # INDICE ABSOLUTO CORREGIDO:
-    my $start_idx = $scale->{offset} < 0 ? 0 : $scale->{offset};
+    # INDICE ABSOLUTO CORREGIDO (con soporte de offset fraccionario):
+    my $start_idx = defined $scale->{slice_start}
+        ? $scale->{slice_start}
+        : ( $scale->{offset} < 0 ? 0 : $scale->{offset} );
 
     for my $i (0 .. $n - 1) {
         my $v   = $values->[$i];

@@ -118,7 +118,12 @@ sub render {
     $body_w = 1 if $body_w < 1;
     my $thin = ( $bar_w < 3 ) ? 1 : 0;
 
-    my $start_idx = $scale->{offset} < 0 ? 0 : $scale->{offset};
+    # Indice absoluto de la primera vela del slice. Con offset fraccionario
+    # (zoom anclado) offset deja de coincidir con el inicio del slice, por eso
+    # se prefiere slice_start (indice entero real del slice) cuando existe.
+    my $start_idx = defined $scale->{slice_start}
+        ? $scale->{slice_start}
+        : ( $scale->{offset} < 0 ? 0 : $scale->{offset} );
 
     for my $i ( 0 .. $#$data ) {
         my $c   = $data->[$i];
