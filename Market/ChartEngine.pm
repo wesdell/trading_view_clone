@@ -306,6 +306,14 @@ sub render {
     $self->{canvas_price}->delete('time_axis');
 
     $self->{price_panel}->render( $self->{canvas_price}, $visible_candles, $scale_price );
+
+    # Overlays (Etapa 2, Fase 2): reutilizan el mismo $scale_price ya
+    # construido arriba -- nunca crean una escala propia. $self->{overlays}
+    # es opcional para no romper compatibilidad si algun consumidor de
+    # ChartEngine no lo provee.
+    $self->{overlays}->render_all( $self->{canvas_price}, $scale_price )
+        if $self->{overlays};
+
     $self->{price_panel}->render_last_visible_price( $self->{canvas_price} );
 
     my $anchors = $self->compute_intraday_labels( $start, $end );

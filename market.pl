@@ -16,6 +16,8 @@ use Market::Panels::Scales;
 use Market::Panels::PricePanel;
 use Market::Panels::ATRPanel;
 use Market::ChartEngine;
+use Market::OverlayManager;
+use Market::Overlays::DemoOverlay;
 
 # =============================================================================
 # VENTANA
@@ -126,6 +128,19 @@ $ind_manager->rebuild_all($market);
 printf "ATR listo: %d valores\n", scalar @{ $ind_manager->get('atr') };
 
 # =============================================================================
+# OVERLAYS — gestor + overlay de validacion (Etapa 2, Fase 2)
+# El overlay 'demo' es temporal: solo confirma que la arquitectura de
+# Overlays funciona (registro, render sincronizado con scroll/zoom,
+# toggle de visibilidad) antes de implementar Liquidity.pm en la Etapa 8.
+# Se debe quitar (o sustituir su registro por el de Liquidity) mas adelante.
+# =============================================================================
+my $overlay_mgr = Market::OverlayManager->new;
+$overlay_mgr->register('demo', Market::Overlays::DemoOverlay->new(
+    price        => $market->last_candle->{close},  # nivel de precio = ultimo close real del CSV
+    marker_index => $market->size - 50,              # cae dentro de la ventana inicial (ultimas 120 velas)
+));
+
+# =============================================================================
 # PANELES Y MOTOR
 # =============================================================================
 my $price_panel = Market::Panels::PricePanel->new(
@@ -140,6 +155,7 @@ my $atr_panel = Market::Panels::ATRPanel->new(
 my $engine = Market::ChartEngine->new(
     market         => $market,
     indicators     => $ind_manager,
+    overlays       => $overlay_mgr,
     canvas_price   => $canvas_price,
     canvas_atr     => $canvas_atr,
     price_panel    => $price_panel,
@@ -173,6 +189,24 @@ $tf_frame->Button(%bs, -text => '+',
 $tf_frame->Button(%bs, -text => '-',
     -command => sub { $engine->_horizontal_zoom(1, 0) })
     ->pack(-side => 'left', -padx => 1, -pady => 2);
+
+$tf_frame->Frame(-background => '#c9cdd7', -width => 1, -height => 16)
+    ->pack(-side => 'left', -pady => 5, -padx => 6);
+
+# --- Checkbutton de visibilidad de overlays (Etapa 2) ---
+my $demo_overlay_visible = 1;
+$tf_frame->Checkbutton(
+    -text       => 'Demo Overlay',
+    -variable   => \$demo_overlay_visible,
+    -onvalue    => 1,
+    -offvalue   => 0,
+    -background => '#f1f3f6',
+    -font       => 'TkDefaultFont 9',
+    -command    => sub {
+        $overlay_mgr->set_visible('demo', $demo_overlay_visible);
+        $engine->request_render;
+    },
+)->pack(-side => 'left', -padx => 4, -pady => 2);
 
 $tf_frame->Frame(-background => '#c9cdd7', -width => 1, -height => 16)
     ->pack(-side => 'left', -pady => 5, -padx => 6);
