@@ -18,6 +18,7 @@ use Market::Panels::ATRPanel;
 use Market::ChartEngine;
 use Market::OverlayManager;
 use Market::Overlays::DemoOverlay;
+use Market::Replay;
 
 # =============================================================================
 # VENTANA
@@ -56,6 +57,9 @@ my $CANVAS_W      = $WIN_W;
 # LAYOUT
 # =============================================================================
 my $tf_frame = $mw->Frame(-background => '#f1f3f6', -height => $TF_BAR_H)
+    ->pack(-fill => 'x', -side => 'top');
+
+my $replay_frame = $mw->Frame(-background => '#eef0f5', -height => $TF_BAR_H)
     ->pack(-fill => 'x', -side => 'top');
 
 my $canvas_price = $mw->Canvas(
@@ -163,6 +167,54 @@ my $engine = Market::ChartEngine->new(
     canvas_w       => $CANVAS_W,
     canvas_price_h => 0,
     canvas_atr_h   => $ATR_H,
+);
+
+# =============================================================================
+# REPLAY (Etapa 3, Fase 2)
+# Los widgets referenciados en on_change se declaran aqui pero se crean
+# mas abajo, en la barra $replay_frame -- mismo patron de closures que
+# ya usa este archivo para sincronizar $mode_btn/$mode_btn_atr.
+# =============================================================================
+my ( $replay_status_lbl, $btn_replay_play, $btn_replay_pause,
+     $btn_replay_step_fwd, $btn_replay_step_back, $btn_replay_fast,
+     $btn_replay_exit );
+
+my $replay;
+$replay = Market::Replay->new(
+    market     => $market,
+    indicators => $ind_manager,
+    schedule   => sub { $canvas_price->after(@_); },
+    on_change  => sub {
+        $engine->follow_replay_pointer;
+
+        my $active  = $replay->is_active;
+        my $playing = $replay->is_playing;
+
+        if ($replay_status_lbl) {
+            my $text = !$active
+                ? 'EN VIVO (replay inactivo)'
+                : sprintf(
+                    'REPLAY %s | %s',
+                    Time::Moment->from_epoch($replay->current_ts)
+                        ->with_offset_same_instant(-300)->strftime('%Y-%m-%d %H:%M:%S'),
+                    ($playing ? ($replay->is_fast ? 'FAST FORWARD' : 'PLAY') : 'PAUSADO'),
+                );
+            $replay_status_lbl->configure(-text => $text);
+        }
+
+        for my $pair (
+            [ $btn_replay_play,       $active ],
+            [ $btn_replay_pause,      $active && $playing ],
+            [ $btn_replay_step_fwd,   $active && !$playing ],
+            [ $btn_replay_step_back,  $active && !$playing ],
+            [ $btn_replay_fast,       $active ],
+            [ $btn_replay_exit,       $active ],
+        ) {
+            my ($btn, $enabled) = @$pair;
+            next unless $btn;
+            $btn->configure(-state => $enabled ? 'normal' : 'disabled');
+        }
+    },
 );
 
 # =============================================================================
@@ -305,6 +357,88 @@ $tf_frame->Label(%bs,
     -foreground => '#787b86',
     -font       => 'TkDefaultFont 7',
 )->pack(-side => 'right', -padx => 10);
+
+# =============================================================================
+# BARRA DE REPLAY (Etapa 3, Fase 2)
+# =============================================================================
+$replay_frame->Label(%bs, -text => 'Replay desde:')
+    ->pack(-side => 'left', -padx => 6);
+
+# Prefill con el timestamp de la vela intermedia del CSV cargado (1m),
+# en el mismo formato ISO que ya usa el propio CSV -- editable por el
+# usuario, parseado con el mismo Time::Moment->from_string que usa la
+# carga del archivo.
+my $default_replay_str = $market->raw_get_candle( int($market->raw_size / 2) )->{time};
+my $replay_date_var = $default_replay_str;
+my $replay_entry = $replay_frame->Entry(
+    -textvariable => \$replay_date_var,
+    -width        => 26,
+    -font         => 'TkFixedFont 9',
+)->pack(-side => 'left', -padx => 2, -pady => 2);
+
+my $btn_replay_start = $replay_frame->Button(%bs,
+    -text    => 'Inicio Replay',
+    -command => sub {
+        my $tm;
+        eval { $tm = Time::Moment->from_string($replay_date_var) };
+        if ($@ || !$tm) {
+            $replay_status_lbl->configure(
+                -text => "Fecha invalida: '$replay_date_var' (formato esperado: 2026-04-15T12:00:00-05:00)"
+            );
+            return;
+        }
+        $replay->start($tm->epoch);
+    },
+)->pack(-side => 'left', -padx => 4, -pady => 2);
+
+$replay_frame->Frame(-background => '#c9cdd7', -width => 1, -height => 16)
+    ->pack(-side => 'left', -pady => 5, -padx => 6);
+
+$btn_replay_step_back = $replay_frame->Button(%bs,
+    -text    => '|< Step',
+    -state   => 'disabled',
+    -command => sub { $replay->step_backward(1); },
+)->pack(-side => 'left', -padx => 1, -pady => 2);
+
+$btn_replay_play = $replay_frame->Button(%bs,
+    -text    => 'Play',
+    -state   => 'disabled',
+    -command => sub { $replay->play; },
+)->pack(-side => 'left', -padx => 1, -pady => 2);
+
+$btn_replay_pause = $replay_frame->Button(%bs,
+    -text    => 'Pause',
+    -state   => 'disabled',
+    -command => sub { $replay->pause; },
+)->pack(-side => 'left', -padx => 1, -pady => 2);
+
+$btn_replay_step_fwd = $replay_frame->Button(%bs,
+    -text    => 'Step >|',
+    -state   => 'disabled',
+    -command => sub { $replay->step_forward(1); },
+)->pack(-side => 'left', -padx => 1, -pady => 2);
+
+$btn_replay_fast = $replay_frame->Button(%bs,
+    -text    => 'Fast Forward >>',
+    -state   => 'disabled',
+    -command => sub { $replay->fast_forward; },
+)->pack(-side => 'left', -padx => 1, -pady => 2);
+
+$replay_frame->Frame(-background => '#c9cdd7', -width => 1, -height => 16)
+    ->pack(-side => 'left', -pady => 5, -padx => 6);
+
+$btn_replay_exit = $replay_frame->Button(%bs,
+    -text       => 'Exit Replay',
+    -foreground => '#ef5350',
+    -state      => 'disabled',
+    -command    => sub { $replay->exit_replay; },
+)->pack(-side => 'left', -padx => 4, -pady => 2);
+
+$replay_status_lbl = $replay_frame->Label(%bs,
+    -text       => 'EN VIVO (replay inactivo)',
+    -foreground => '#363a45',
+    -font       => 'TkDefaultFont 9 bold',
+)->pack(-side => 'left', -padx => 10);
 
 # =============================================================================
 # DRAG DEL SEPARADOR ATR

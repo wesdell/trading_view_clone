@@ -46,6 +46,12 @@ sub new {
     my $self = {
         data => \%data,
         tf   => '1m',
+
+        # Frontera de Replay (Etapa 3, Fase 2): undef = modo "en vivo",
+        # sin restriccion (comportamiento de Fase 1 intacto). Si tiene
+        # un valor, es un timestamp epoch: ningun accesor publico debe
+        # exponer velas con ts posterior a este valor.
+        replay_boundary_ts => undef,
     };
     bless $self, $class;
     return $self;
@@ -163,38 +169,129 @@ sub _active_array {
     return $self->{data}{ $self->{tf} };
 }
 
-sub get_slice {
-    my ($self, $start, $end) = @_;
-    my $arr  = $self->_active_array;
-    my $last = $#$arr;
-    $start   = 0     if $start < 0;
-    $end     = $last if $end > $last;
-    return [] if $start > $end;
-    return [ @{$arr}[$start .. $end] ];
+# -----------------------------------------------------------------------------
+# _effective_last_index (privado)
+# Devuelve el ultimo indice visible del array activo, respetando la
+# frontera de Replay si esta activa. Sin frontera, es simplemente
+# $#$arr (comportamiento de Fase 1, intacto). Con frontera, es el
+# ultimo indice cuyo ts no supera replay_boundary_ts, encontrado por
+# busqueda binaria (el array esta siempre ordenado ascendente por ts).
+#
+# Este es el UNICO punto del sistema donde se decide "hasta donde se
+# puede ver". Todos los accesores publicos (size, last_candle,
+# last_index, get_candle, get_slice, compute_time_anchors) delegan
+# aqui, por lo que automaticamente respetan el replay sin que el
+# resto del sistema (IndicatorManager, ChartEngine, Overlays) necesite
+# saber que existe.
+# -----------------------------------------------------------------------------
+sub _effective_last_index {
+    my ($self) = @_;
+    my $arr = $self->_active_array;
+    my $hi  = $#$arr;
+
+    return $hi unless defined $self->{replay_boundary_ts};
+    return -1 if $hi < 0;
+
+    my $boundary = $self->{replay_boundary_ts};
+    return -1 if $arr->[0]{ts}  > $boundary;   # el replay arranca antes de todos los datos
+    return $hi if $arr->[$hi]{ts} <= $boundary; # el replay ya cubre todo el array
+
+    my ($lo, $found) = (0, -1);
+    while ($lo <= $hi) {
+        my $mid = int( ($lo + $hi) / 2 );
+        if ( $arr->[$mid]{ts} <= $boundary ) {
+            $found = $mid;
+            $lo    = $mid + 1;
+        } else {
+            $hi = $mid - 1;
+        }
+    }
+    return $found;
 }
 
-sub get_candle {
+# -----------------------------------------------------------------------------
+# set_replay_boundary / clear_replay_boundary / get_replay_boundary /
+# is_replay_active
+# Gestion de la frontera de Replay. set_replay_boundary(undef) equivale
+# a clear_replay_boundary().
+# -----------------------------------------------------------------------------
+sub set_replay_boundary {
+    my ($self, $ts) = @_;
+    $self->{replay_boundary_ts} = $ts;
+}
+
+sub clear_replay_boundary {
+    my ($self) = @_;
+    $self->{replay_boundary_ts} = undef;
+}
+
+sub get_replay_boundary {
+    my ($self) = @_;
+    return $self->{replay_boundary_ts};
+}
+
+sub is_replay_active {
+    my ($self) = @_;
+    return defined $self->{replay_boundary_ts} ? 1 : 0;
+}
+
+# -----------------------------------------------------------------------------
+# raw_last_index / raw_get_candle / raw_size
+# Accesores que IGNORAN la frontera de Replay -- ven el array activo
+# completo. Uso EXCLUSIVO de Market::Replay (necesita saber hasta donde
+# puede avanzar el puntero y "espiar" la siguiente vela real). Ningun
+# otro consumidor del sistema (ChartEngine, IndicatorManager, Overlays)
+# debe usar estos metodos.
+# -----------------------------------------------------------------------------
+sub raw_last_index {
+    my ($self) = @_;
+    return $#{ $self->_active_array };
+}
+
+sub raw_size {
+    my ($self) = @_;
+    return scalar @{ $self->_active_array };
+}
+
+sub raw_get_candle {
     my ($self, $index) = @_;
     my $arr = $self->_active_array;
     return undef if $index < 0 || $index > $#$arr;
     return $arr->[$index];
 }
 
+sub get_slice {
+    my ($self, $start, $end) = @_;
+    my $arr  = $self->_active_array;
+    my $last = $self->_effective_last_index;
+    $start   = 0     if $start < 0;
+    $end     = $last if $end > $last;
+    return [] if $last < 0 || $start > $end;
+    return [ @{$arr}[$start .. $end] ];
+}
+
+sub get_candle {
+    my ($self, $index) = @_;
+    my $last = $self->_effective_last_index;
+    return undef if $index < 0 || $index > $last;
+    return $self->_active_array->[$index];
+}
+
 sub size {
     my ($self) = @_;
-    return scalar @{ $self->_active_array };
+    return $self->_effective_last_index + 1;
 }
 
 sub last_candle {
     my ($self) = @_;
-    my $arr = $self->_active_array;
-    return undef unless @$arr;
-    return $arr->[-1];
+    my $idx = $self->_effective_last_index;
+    return undef if $idx < 0;
+    return $self->_active_array->[$idx];
 }
 
 sub last_index {
     my ($self) = @_;
-    return $#{ $self->_active_array };
+    return $self->_effective_last_index;
 }
 
 sub get_timestamp {
@@ -221,11 +318,12 @@ sub merge_delta_row {
 sub compute_time_anchors {
     my ($self) = @_;
     my $arr      = $self->_active_array;
+    my $last     = $self->last_index;   # consciente de la frontera de replay
     my @anchors;
     my $last_day  = -1;
     my $last_hour = -1;
 
-    for my $i (0 .. $#$arr) {
+    for my $i (0 .. $last) {
         my $ts  = $arr->[$i]{ts};
         my $tm  = Time::Moment->from_epoch($ts);
 

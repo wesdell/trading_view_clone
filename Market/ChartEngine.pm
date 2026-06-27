@@ -1134,6 +1134,25 @@ sub reset_view {
     $self->{offset} = 0 if $self->{offset} < 0;
 }
 
+# -----------------------------------------------------------------------------
+# follow_replay_pointer (Etapa 3, Fase 2)
+# Reposiciona la ventana visible para que la ultima vela del puntero de
+# Replay quede a la vista, SIN tocar visible_bars ni el estado de zoom
+# vertical -- a diferencia de reset_view, que reinicia todo. Se llama
+# desde el callback on_change de Market::Replay cada vez que el puntero
+# avanza/retrocede/arranca/sale, para que el usuario nunca pierda de
+# vista la vela que el replay esta mostrando, conservando el zoom que
+# tenia elegido.
+# -----------------------------------------------------------------------------
+sub follow_replay_pointer {
+    my ($self) = @_;
+    my $total = $self->{market}->size;
+    return if $total <= 0;
+
+    $self->{offset} = $total - $self->{visible_bars};
+    $self->request_render;
+}
+
 sub compute_intraday_labels {
     my ( $self, $start, $end ) = @_;
 
