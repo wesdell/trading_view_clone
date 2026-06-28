@@ -111,7 +111,8 @@ sub render {
     my @seg;
     my $n = scalar @$values;
     
-    # INDICE ABSOLUTO CORREGIDO (con soporte de offset fraccionario):
+    # FIX: ver nota equivalente en PricePanel::render -- offset puede ser
+    # fraccionario, slice_start es el indice ENTERO real del recorte.
     my $start_idx = defined $scale->{slice_start}
         ? $scale->{slice_start}
         : ( $scale->{offset} < 0 ? 0 : $scale->{offset} );

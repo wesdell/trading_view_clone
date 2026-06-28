@@ -3,24 +3,63 @@ package Market::Indicators::Liquidity;
 # =============================================================================
 # Market::Indicators::Liquidity   (Tabla 1 del PDF)
 #
-# Motor de deteccion analitica de Swing Points, EQH/EQL, BSL/SSL y de la
-# maquina de estados de liquidez (Sweep / Grab / Run). SOLO calcula y
-# almacena datos: NUNCA dibuja en el Canvas (eso es Overlays/Liquidity.pm).
-#
-# Cumple el contrato de IndicatorManager:
-#   - update_at_index($md, $idx)   (rebuild secuencial)
-#   - update_last($md)             (streaming / avance de replay)
+# Calculo de Swing Points (High/Low), niveles de liquidez BSL/SSL, pares
+# EQH/EQL y la maquina de estados Sweep/Grab/Run. NO dibuja nada (eso es
+# Overlays/Liquidity.pm). Contrato IndicatorManager (igual que ATR.pm):
+#   - update_at_index($market_data, $i)
+#   - update_last($market_data)
+#   - get_values()
 #   - reset()
-#   - get_values()                 (vacio: este indicador expone eventos, no
-#                                    una serie escalar paralela a las velas)
 #
-# Garantia anti-futuro: se procesa vela a vela en orden. Un swing en el indice
-# j SOLO se confirma cuando ya existen las k velas posteriores (j+k). Por eso,
-# durante el Replay (donde MarketData acota el dataset), jamas se confirma una
-# estructura usando informacion que el operador "todavia no deberia conocer".
+# Contrato adicional consumido por Overlays/Liquidity.pm e
+# Indicators/SMC_Structures.pm:
+#   get_swings()       -> [ {id,index,ts,price,kind:'H'|'L'}, ... ]
+#   get_levels()       -> [ {id,side:'buy'|'sell',price,index,state,
+#                             classification,swept_at_index,
+#                             resolved_at_index}, ... ]
+#   get_equals()       -> [ {kind:'EQH'|'EQL',i1,i2,p1,p2}, ... ]
+#   get_events()       -> [ {type:'SWEEP'|'GRAB'|'RUN',dir:'up'|'down',
+#                             index,price,label}, ... ]
+#   last_swing_high()  -> {index,price,...} | undef
+#   last_swing_low()   -> {index,price,...} | undef
+#   side_label($side)  -> 'BSL' | 'SSL'
 #
-# Referencias teoricas: Teoria1.txt (estructura de mercado, BOS/CHoCH) y
-# Teoria2.txt (liquidez, sweeps, equal highs/lows), seccion 4 del PDF.
+# GARANTIA DE NO-FUGA DE FUTURO:
+#   - Swings: un swing en el indice c con profundidad k SOLO es
+#     matematicamente confirmable cuando existen las k velas posteriores
+#     (c+1..c+k). Este indicador evalua, al recibir la vela visible con
+#     indice i, el CANDIDATO c = i - k (nunca la vela i misma). El swing
+#     se registra exactamente en el instante en que i = c+k se vuelve
+#     visible -- nunca antes. No hay verificacion adicional de replay:
+#     la seguridad es consecuencia directa de la definicion del swing.
+#   - Maquina de estados (Sweep/Swept/Reclaimed/Acceptance/Resolved):
+#     evalua SOLO con la vela actualmente visible y el historial de
+#     velas ya procesadas (swept_at_index, contador de velas desde el
+#     sweep) -- nunca necesita mirar hacia adelante, por lo que no
+#     requiere ningun retraso adicional.
+#
+# EQH/EQL: dos swings del MISMO tipo (H/H o L/L) se consideran "iguales"
+# si |precio_1 - precio_2| <= ATR(en el indice del swing mas reciente)
+# * eq_factor (0.10 por defecto).
+#
+# Maquina de estados (orden de evaluacion en cada vela, sobre niveles
+# abiertos):
+#   DETECTED  -> SWEPT      : High > nivel (BSL) o Low < nivel (SSL).
+#   SWEPT     -> RESOLVED   : evaluado vela por vela desde el sweep
+#       (n_since = velas transcurridas DESDE Y CON la vela del sweep):
+#         a) cierre vuelve dentro del rango Y n_since <= grab_window
+#            -> clasificacion GRAB.
+#         b) cierre vuelve dentro del rango Y n_since >  grab_window
+#            -> clasificacion SWEEP.
+#         c) cierre se mantiene fuera del rango por n_since >=
+#            acceptance_n (sin haber vuelto dentro antes)
+#            -> clasificacion RUN.
+#   IMPORTANTE: acceptance_n DEBE ser > grab_window, o la clasificacion
+#   SWEEP (reclamo "estandar", no tan rapido como un Grab) jamas podria
+#   ocurrir -- todo se resolveria como GRAB o RUN antes de tener
+#   oportunidad de caer en la rama intermedia. Default: grab_window=3
+#   (valor explicito del PDF), acceptance_n=10 (parametrizable, sin
+#   valor recomendado en el PDF; elegido > grab_window a proposito).
 # =============================================================================
 
 use strict;
@@ -29,287 +68,303 @@ use warnings;
 sub new {
     my ( $class, %args ) = @_;
     my $self = {
-        atr          => $args{atr},                 # objeto indicador ATR (tolerancia EQH/EQL)
-        k            => $args{k}          // 3,     # profundidad de swing
-        eq_factor    => $args{eq_factor}  // 0.10,  # tolerancia = ATR * 0.10
-        accept_n     => $args{accept_n}   // 3,     # velas para Acceptance -> Run
-        grab_window  => $args{grab_window} // 3,    # ventana de Grab (rechazo rapido)
+        k            => $args{k}            // 3,
+        eq_factor    => $args{eq_factor}    // 0.10,
+        grab_window  => $args{grab_window}  // 3,
+        acceptance_n => $args{acceptance_n} // 10,
+        atr          => $args{atr},   # referencia DIRECTA al objeto ATR
 
-        # Cota de niveles "en observacion" simultaneos. La liquidez lejana en
-        # el tiempo que el precio nunca volvio a tocar deja de evaluarse (como
-        # en TradingView/ICT). Evita el coste cuadratico de revisar miles de
-        # niveles DETECTED por vela en temporalidades grandes (1m).
-        max_active   => $args{max_active} // 160,
+        swings => [],   # todos los swings confirmados, en orden de confirmacion
+        levels => [],   # TODOS los niveles (cualquier estado), en orden de creacion
+        equals => [],   # pares EQH/EQL (puramente geometrico, no es un "nivel")
+        events => [],   # eventos Sweep/Grab/Run ya resueltos
 
-        _c      => [],   # velas procesadas (refs)
-        _swings => [],   # { kind=>'H'|'L', index, ts, price }
-        _levels => [],   # niveles BSL/SSL (historico completo, para el overlay)
-        _active => [],   # subconjunto en observacion (DETECTED|SWEPT)
-        _events => [],   # eventos resueltos (Sweep/Grab/Run)
-        _eq     => [],   # pares Equal High / Equal Low
-
-        # Buffers O(1): ultimos swings recientes por tipo (para EQH/EQL) y el
-        # ultimo swing confirmado de cada tipo (estructura "mayor" para SMC).
-        _buf_h    => [],
-        _buf_l    => [],
-        _recent_h => undef,
-        _recent_l => undef,
+        _open_level_refs      => [],   # niveles en DETECTED o SWEPT (working set)
+        _next_id               => 1,
+        _last_evaluated_index  => -1,  # ultimo candidato de swing ya evaluado
     };
+
+    die "Market::Indicators::Liquidity: acceptance_n debe ser > grab_window "
+      . "(SWEEP nunca podria ocurrir si no)"
+      if $self->{acceptance_n} <= $self->{grab_window};
+
     bless $self, $class;
     return $self;
 }
 
-# Contrato IndicatorManager (no produce serie escalar).
-sub get_values { return []; }
-
+# -----------------------------------------------------------------------------
+# reset
+# -----------------------------------------------------------------------------
 sub reset {
     my ($self) = @_;
-    $self->{_c}      = [];
-    $self->{_swings} = [];
-    $self->{_levels} = [];
-    $self->{_active} = [];
-    $self->{_events} = [];
-    $self->{_eq}     = [];
-    $self->{_buf_h}    = [];
-    $self->{_buf_l}    = [];
-    $self->{_recent_h} = undef;
-    $self->{_recent_l} = undef;
+    $self->{swings} = [];
+    $self->{levels} = [];
+    $self->{equals} = [];
+    $self->{events} = [];
+    $self->{_open_level_refs}     = [];
+    $self->{_next_id}             = 1;
+    $self->{_last_evaluated_index} = -1;
 }
 
-sub update_at_index {
-    my ( $self, $md, $idx ) = @_;
-    my $c = $md->get_candle($idx);
-    return unless defined $c;
-    $self->_process($c);
+# -----------------------------------------------------------------------------
+# Accesores de solo lectura
+# -----------------------------------------------------------------------------
+sub get_values { return $_[0]->{levels}; }
+sub get_swings { return $_[0]->{swings}; }
+sub get_levels { return $_[0]->{levels}; }
+sub get_equals { return $_[0]->{equals}; }
+sub get_events { return $_[0]->{events}; }
+
+sub last_swing_high {
+    my ($self) = @_;
+    for my $sw ( reverse @{ $self->{swings} } ) {
+        return $sw if $sw->{kind} eq 'H';
+    }
+    return undef;
 }
 
+sub last_swing_low {
+    my ($self) = @_;
+    for my $sw ( reverse @{ $self->{swings} } ) {
+        return $sw if $sw->{kind} eq 'L';
+    }
+    return undef;
+}
+
+sub side_label {
+    my ( $self, $side ) = @_;
+    return $side eq 'buy' ? 'BSL' : 'SSL';
+}
+
+# -----------------------------------------------------------------------------
+# update_last (streaming / replay incremental)
+# -----------------------------------------------------------------------------
 sub update_last {
-    my ( $self, $md ) = @_;
-    my $c = $md->last_candle;
-    return unless defined $c;
-    $self->_process($c);
+    my ( $self, $market_data ) = @_;
+    my $idx = $market_data->last_index;
+    return if $idx < 0;
+    $self->update_at_index( $market_data, $idx );
 }
 
 # -----------------------------------------------------------------------------
-# Accesores de solo lectura para el Overlay.
+# update_at_index (rebuild / cada vela nueva visible)
+# Orden: (1) maquina de estados sobre niveles ya abiertos, usando la vela
+# $i directamente; (2) deteccion de swing en el candidato c=i-k. El orden
+# es seguro en ambos sentidos: un nivel recien creado en (2) no puede ser
+# barrido por su propia vela de confirmacion (ya se verifico que esa vela
+# NO supera el nivel, es parte de la propia definicion de swing), asi que
+# no importa si (2) ocurriera antes de (1).
 # -----------------------------------------------------------------------------
-sub get_swings { return $_[0]->{_swings}; }
-sub get_levels { return $_[0]->{_levels}; }
-sub get_events { return $_[0]->{_events}; }
-sub get_equals { return $_[0]->{_eq}; }
+sub update_at_index {
+    my ( $self, $market_data, $i ) = @_;
 
-# Ultimo swing confirmado de cada tipo (estructura "mayor" que consume SMC).
-sub last_swing_high { return $_[0]->{_recent_h}; }
-sub last_swing_low  { return $_[0]->{_recent_l}; }
+    $self->_update_state_machine( $market_data, $i );
 
-# -----------------------------------------------------------------------------
-# _atr_at: valor de ATR en un indice (para tolerancia EQH/EQL).
-# -----------------------------------------------------------------------------
-sub _atr_at {
-    my ( $self, $i ) = @_;
-    return 0 unless $self->{atr};
-    my $v = $self->{atr}->get_values;
-    return 0 unless $v && @$v;
-    my $a = ( $i >= 0 && $i <= $#$v ) ? $v->[$i] : $v->[-1];
-    return defined $a ? $a : 0;
-}
-
-# -----------------------------------------------------------------------------
-# _process: integra una vela nueva en el indice n = $#_c.
-# -----------------------------------------------------------------------------
-sub _process {
-    my ( $self, $c ) = @_;
-    push @{ $self->{_c} }, $c;
-    my $i = $#{ $self->{_c} };          # indice absoluto de la vela actual
     my $k = $self->{k};
+    my $c = $i - $k;
+    return if $c < $k;
+    return if $c <= $self->{_last_evaluated_index};
 
-    # 1) Confirmacion de swing en j = i - k (ya existen las k velas a la derecha)
-    my $j = $i - $k;
-    if ( $j - $k >= 0 ) {
-        $self->_confirm_swing($j);
+    $self->_evaluate_swing_candidate( $market_data, $c, $k );
+    $self->{_last_evaluated_index} = $c;
+}
+
+# =============================================================================
+# SWING POINTS / EQH-EQL
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# _evaluate_swing_candidate (privado)
+# High[c] > High[c-k..c-1] y High[c] > High[c+1..c+k] (estrictamente mayor
+# que TODAS, no solo el maximo) -- analogo para Low.
+# -----------------------------------------------------------------------------
+sub _evaluate_swing_candidate {
+    my ( $self, $market_data, $c, $k ) = @_;
+
+    my $candle = $market_data->get_candle($c);
+    return unless $candle;
+
+    my ( $is_high, $is_low ) = ( 1, 1 );
+    for my $j ( ( $c - $k ) .. ( $c + $k ) ) {
+        next if $j == $c;
+        my $other = $market_data->get_candle($j);
+        return unless $other;   # defensivo: no deberia faltar en este rango
+
+        $is_high = 0 if $other->{high} >= $candle->{high};
+        $is_low  = 0 if $other->{low}  <= $candle->{low};
+        last if !$is_high && !$is_low;
     }
 
-    # 2) Avanzar la maquina de estados de cada nivel no resuelto.
-    $self->_advance_levels($i);
+    $self->_register_swing( 'H', $candle, $c ) if $is_high;
+    $self->_register_swing( 'L', $candle, $c ) if $is_low;
 }
 
 # -----------------------------------------------------------------------------
-# _confirm_swing: aplica la condicion de vecindad simetrica (PDF 4.1).
-#   Swing High: High[j] > High[j-k..j-1]  y  High[j] > High[j+1..j+k]
-#   Swing Low : Low[j]  < Low[j-k..j-1]   y  Low[j]  < Low[j+1..j+k]
+# _register_swing (privado)
 # -----------------------------------------------------------------------------
-sub _confirm_swing {
-    my ( $self, $j ) = @_;
-    my $c   = $self->{_c};
-    my $k   = $self->{k};
-    my $piv = $c->[$j];
+sub _register_swing {
+    my ( $self, $kind, $candle, $idx ) = @_;
 
-    my $is_high = 1;
-    my $is_low  = 1;
-    for my $m ( $j - $k .. $j + $k ) {
-        next if $m == $j;
-        $is_high = 0 if $c->[$m]{high} >= $piv->{high};
-        $is_low  = 0 if $c->[$m]{low}  <= $piv->{low};
-    }
+    my $swing = {
+        id    => $self->{_next_id}++,
+        kind  => $kind,   # 'H' | 'L'
+        index => $idx,
+        ts    => $candle->{ts},
+        price => ( $kind eq 'H' ? $candle->{high} : $candle->{low} ),
+    };
+    push @{ $self->{swings} }, $swing;
 
-    if ($is_high) {
-        my $sw = { kind => 'H', index => $j, ts => $piv->{ts}, price => $piv->{high} };
-        push @{ $self->{_swings} }, $sw;
-        $self->{_recent_h} = $sw;
-        $self->_register_level( 'buy', $j, $piv->{high}, $piv->{ts} );      # BSL
-        $self->_check_equal( $self->{_buf_h}, 'EQH', $sw );                  # EQH
-        push @{ $self->{_buf_h} }, $sw;
-        shift @{ $self->{_buf_h} } while @{ $self->{_buf_h} } > 6;
-    }
-    if ($is_low) {
-        my $sw = { kind => 'L', index => $j, ts => $piv->{ts}, price => $piv->{low} };
-        push @{ $self->{_swings} }, $sw;
-        $self->{_recent_l} = $sw;
-        $self->_register_level( 'sell', $j, $piv->{low}, $piv->{ts} );      # SSL
-        $self->_check_equal( $self->{_buf_l}, 'EQL', $sw );                  # EQL
-        push @{ $self->{_buf_l} }, $sw;
-        shift @{ $self->{_buf_l} } while @{ $self->{_buf_l} } > 6;
-    }
+    my $level = $self->_register_level( $kind, $swing );
+    push @{ $self->{_open_level_refs} }, $level;
+
+    $self->_check_equal_levels( $kind, $swing );
 }
 
 # -----------------------------------------------------------------------------
-# _register_level: crea un nivel de liquidez en estado DETECTED.
-#   side 'buy'  -> BSL (encima de un swing high): ordenes Buy Stop.
-#   side 'sell' -> SSL (debajo de un swing low) : ordenes Sell Stop.
+# _register_level (privado)
+# side 'buy' = BSL (de un swing high) | 'sell' = SSL (de un swing low).
+# Nace en estado DETECTED (Estado 1 del diagrama del PDF).
 # -----------------------------------------------------------------------------
 sub _register_level {
-    my ( $self, $side, $idx, $price, $ts ) = @_;
-    my $lv = {
-        side    => $side,
-        kind    => ( $side eq 'buy' ? 'BSL' : 'SSL' ),
-        index   => $idx,
-        ts      => $ts,
-        price   => $price,
-        state   => 'DETECTED',      # DETECTED -> SWEPT -> RESOLVED
-        swept_i => undef,
-        out_n   => 0,               # cierres consecutivos fuera del nivel
-        result  => undef,           # SWEEP | GRAB | RUN (inmutable al resolver)
+    my ( $self, $kind, $swing ) = @_;
+
+    my $level = {
+        id                => $self->{_next_id}++,
+        side              => ( $kind eq 'H' ? 'buy' : 'sell' ),
+        price             => $swing->{price},
+        index             => $swing->{index},
+        origin_swing_id   => $swing->{id},
+        state             => 'DETECTED',
+        classification    => undef,
+        swept_at_index    => undef,
+        resolved_at_index => undef,
     };
-    push @{ $self->{_levels} }, $lv;   # historico (overlay)
-    push @{ $self->{_active} }, $lv;   # en observacion (maquina de estados)
+    push @{ $self->{levels} }, $level;
+    return $level;
 }
 
 # -----------------------------------------------------------------------------
-# _check_equal: detecta EQH/EQL comparando el swing nuevo contra el buffer de
-# swings recientes del mismo tipo, con tolerancia dinamica = ATR * eq_factor
-# (PDF 4.1). O(1) por swing gracias al buffer acotado.
+# _check_equal_levels (privado)
+# Compara el swing recien confirmado contra TODOS los swings previos del
+# mismo tipo. Cada par dentro de tolerancia genera una entrada en
+# get_equals() (puramente geometrica/informativa, no crea un nivel nuevo
+# ni afecta la maquina de estados del nivel ya registrado por el swing).
 # -----------------------------------------------------------------------------
-sub _check_equal {
-    my ( $self, $buf, $eqkind, $sw ) = @_;
-    my $tol = $self->_atr_at( $sw->{index} ) * $self->{eq_factor};
+sub _check_equal_levels {
+    my ( $self, $kind, $new_swing ) = @_;
+    return unless $self->{atr};
 
-    for ( my $p = $#$buf ; $p >= 0 ; $p-- ) {
-        my $prev = $buf->[$p];
-        if ( abs( $prev->{price} - $sw->{price} ) <= $tol ) {
-            push @{ $self->{_eq} }, {
-                kind => $eqkind,
-                i1   => $prev->{index}, p1 => $prev->{price}, ts1 => $prev->{ts},
-                i2   => $sw->{index},   p2 => $sw->{price},   ts2 => $sw->{ts},
-            };
-            last;
-        }
+    my $atr_values = $self->{atr}->get_values;
+    return unless $atr_values && @$atr_values;
+
+    my $atr_at_new = $atr_values->[ $new_swing->{index} ];
+    return unless defined $atr_at_new;
+
+    my $tolerance = $atr_at_new * $self->{eq_factor};
+
+    for my $prev ( @{ $self->{swings} } ) {
+        next if $prev->{id} == $new_swing->{id};
+        next unless $prev->{kind} eq $kind;
+
+        my $diff = abs( $prev->{price} - $new_swing->{price} );
+        next if $diff > $tolerance;
+
+        push @{ $self->{equals} }, {
+            kind => ( $kind eq 'H' ? 'EQH' : 'EQL' ),
+            i1   => $prev->{index},
+            i2   => $new_swing->{index},
+            p1   => $prev->{price},
+            p2   => $new_swing->{price},
+        };
     }
 }
 
-# -----------------------------------------------------------------------------
-# _advance_levels: maquina de estados de la seccion 4.2-4.3 del PDF.
-#   DETECTED -> SWEPT      cuando el precio cruza el extremo del nivel.
-#   SWEPT    -> RESOLVED   clasificando en:
-#       SWEEP : la vela del barrido cierra de vuelta dentro del rango previo
-#               (o reclama dentro tras la ventana de grab).
-#       GRAB  : reclamo/rechazo rapido dentro de <= grab_window velas.
-#       RUN   : accept_n cierres consecutivos estrictamente fuera del nivel.
-# -----------------------------------------------------------------------------
-sub _advance_levels {
-    my ( $self, $i ) = @_;
-    my $cur = $self->{_c}[$i];
-    my $gw  = $self->{grab_window};
-    my $an  = $self->{accept_n};
+# =============================================================================
+# MAQUINA DE ESTADOS: Detected -> Swept -> (Acceptance|Reclaimed) -> Resolved
+# =============================================================================
 
-    for my $lv ( @{ $self->{_active} } ) {
-        next if $lv->{state} eq 'RESOLVED';
-        next if $lv->{index} >= $i;     # no evaluar contra su propia vela origen
+sub _update_state_machine {
+    my ( $self, $market_data, $i ) = @_;
+    my $candle = $market_data->get_candle($i);
+    return unless $candle;
 
-        my $buy   = ( $lv->{side} eq 'buy' );
-        my $price = $lv->{price};
-
-        if ( $lv->{state} eq 'DETECTED' ) {
-            my $crossed = $buy ? ( $cur->{high} > $price ) : ( $cur->{low} < $price );
-            next unless $crossed;
-
-            $lv->{state}   = 'SWEPT';
-            $lv->{swept_i} = $i;
-
-            my $inside = $buy ? ( $cur->{close} < $price ) : ( $cur->{close} > $price );
-            if ($inside) {
-                $self->_resolve( $lv, 'SWEEP', $i );   # barrido y cierre dentro: Sweep
-            } else {
-                $lv->{out_n} = 1;                      # cerro fuera: pendiente
-            }
-            next;
+    my @still_open;
+    for my $level ( @{ $self->{_open_level_refs} } ) {
+        if ( $level->{state} eq 'DETECTED' ) {
+            $self->_check_sweep( $level, $candle, $i );
         }
-
-        if ( $lv->{state} eq 'SWEPT' ) {
-            my $inside = $buy ? ( $cur->{close} < $price ) : ( $cur->{close} > $price );
-            if ($inside) {
-                my $span = $i - $lv->{swept_i};
-                my $type = ( $span <= $gw ) ? 'GRAB' : 'SWEEP';
-                $self->_resolve( $lv, $type, $i );
-            } else {
-                $lv->{out_n}++;
-                $self->_resolve( $lv, 'RUN', $i ) if $lv->{out_n} >= $an;
-            }
+        if ( $level->{state} eq 'SWEPT' ) {
+            $self->_check_resolution( $level, $candle, $i );
         }
+        push @still_open, $level unless $level->{state} eq 'RESOLVED';
     }
-
-    # ----- Poda del set en observacion -----
-    # 1) sacar los ya resueltos. 2) si excede max_active, descartar los
-    # DETECTED mas antiguos (liquidez lejana que el precio nunca revisito);
-    # los SWEPT se conservan siempre porque resuelven en pocas velas.
-    my @keep = grep { $_->{state} ne 'RESOLVED' } @{ $self->{_active} };
-    if ( @keep > $self->{max_active} ) {
-        my @swept = grep { $_->{state} eq 'SWEPT' }    @keep;
-        my @det   = grep { $_->{state} eq 'DETECTED' } @keep;
-        my $room  = $self->{max_active} - scalar @swept;
-        $room = 0 if $room < 0;
-        @det = ( $room > 0 && @det > $room ) ? @det[ -$room .. -1 ]
-             : ( $room > 0 ? @det : () );
-        @keep = ( @swept, @det );
-    }
-    $self->{_active} = \@keep;
+    $self->{_open_level_refs} = \@still_open;
 }
 
 # -----------------------------------------------------------------------------
-# _resolve: archiva la clasificacion final (inmutable) y emite el evento que
-# consumira el Overlay.
+# _check_sweep (privado) -- Estado 1 (Detected) -> Estado 2 (Swept)
+# BSL ('buy'): High > price.  SSL ('sell'): Low < price.
+# -----------------------------------------------------------------------------
+sub _check_sweep {
+    my ( $self, $level, $candle, $i ) = @_;
+
+    my $swept =
+        ( $level->{side} eq 'buy' )
+      ? ( $candle->{high} > $level->{price} )
+      : ( $candle->{low}  < $level->{price} );
+    return unless $swept;
+
+    $level->{state}          = 'SWEPT';
+    $level->{swept_at_index} = $i;
+}
+
+# -----------------------------------------------------------------------------
+# _check_resolution (privado) -- Estado 2 (Swept) -> Estado 5 (Resolved)
+# n_since incluye la propia vela del sweep (n_since=1 en esa misma vela).
+# -----------------------------------------------------------------------------
+sub _check_resolution {
+    my ( $self, $level, $candle, $i ) = @_;
+
+    my $n_since = $i - $level->{swept_at_index} + 1;
+
+    my $closed_inside =
+        ( $level->{side} eq 'buy' )
+      ? ( $candle->{close} <= $level->{price} )
+      : ( $candle->{close} >= $level->{price} );
+
+    if ($closed_inside) {
+        my $classification =
+            ( $n_since <= $self->{grab_window} ) ? 'GRAB' : 'SWEEP';
+        $self->_resolve( $level, $classification, $i );
+        return;
+    }
+
+    if ( $n_since >= $self->{acceptance_n} ) {
+        $self->_resolve( $level, 'RUN', $i );
+        return;
+    }
+
+    # Sigue abierto (Swept), esperando resolucion en velas siguientes.
+}
+
+# -----------------------------------------------------------------------------
+# _resolve (privado) -- Estado 5 (Resolved): clasificacion final inmutable
+# + emite el evento correspondiente para get_events().
 # -----------------------------------------------------------------------------
 sub _resolve {
-    my ( $self, $lv, $type, $i ) = @_;
-    $lv->{state}  = 'RESOLVED';
-    $lv->{result} = $type;
+    my ( $self, $level, $classification, $i ) = @_;
 
-    my $cur  = $self->{_c}[$i];
-    my $buy  = ( $lv->{side} eq 'buy' );
-    my $label =
-        ( $type eq 'SWEEP' ) ? ( $buy ? "SWEEP \x{2191}" : "SWEEP \x{2193}" )
-      : ( $type eq 'GRAB' )  ? 'LQ GRAB'
-      :                        'LQ RUN';
+    $level->{state}             = 'RESOLVED';
+    $level->{classification}    = $classification;
+    $level->{resolved_at_index} = $i;
 
-    push @{ $self->{_events} }, {
-        type   => $type,                       # SWEEP | GRAB | RUN
-        side   => $lv->{side},                 # buy | sell
-        dir    => ( $buy ? 'up' : 'down' ),
-        index  => $i,                          # vela donde se resuelve
-        ts     => $cur->{ts},
-        price  => $lv->{price},
-        origin => $lv->{index},                # vela del nivel original
-        label  => $label,
-        state  => 'RESOLVED',
+    my $dir = ( $level->{side} eq 'buy' ) ? 'up' : 'down';
+    push @{ $self->{events} }, {
+        type  => $classification,   # 'SWEEP' | 'GRAB' | 'RUN'
+        dir   => $dir,              # 'up' | 'down'
+        index => $i,                # vela de RESOLUCION (no la del sweep)
+        price => $level->{price},
+        label => $self->side_label( $level->{side} ) . ' ' . $classification,
     };
 }
 
