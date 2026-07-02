@@ -35,6 +35,11 @@ my %TF_MINUTES = (
 # dia/fecha). Offset en minutos para Time::Moment->from_epoch.
 use constant GMT_OFFSET_MIN => -300;
 
+# Segundos al oeste de UTC para la zona horaria local (UTC-5).
+# Usado para anclar los buckets de temporalidades intradía
+# (especialmente 2h y 4h) a medianoche local en vez de UTC.
+use constant LOCAL_OFFSET_SEC => 5 * 3600;
+
 # -----------------------------------------------------------------------------
 # new
 # -----------------------------------------------------------------------------
@@ -80,7 +85,14 @@ sub _bucket_ts_for {
 
     if (exists $TF_MINUTES{$tf}) {
         my $interval_sec = $TF_MINUTES{$tf} * 60;
-        return int($ts / $interval_sec) * $interval_sec;
+        # FIX: anclar a medianoche local (UTC-5), no UTC. La division naive
+        # es correcta para 5m/15m/1h (el offset 18000s es multiplo de 300,
+        # 900 y 3600), pero desalinea 2h y 4h porque 18000/7200=2.5 y
+        # 18000/14400=1.25. Con el fix, la primera vela de abril (00:00 UTC-5)
+        # abre correctamente a las 01:00 EDT en vez de las 23:00 del dia
+        # anterior como hacia el codigo original.
+        my $local = $ts - LOCAL_OFFSET_SEC;
+        return int($local / $interval_sec) * $interval_sec + LOCAL_OFFSET_SEC;
     }
 
     if ($tf eq 'D') {

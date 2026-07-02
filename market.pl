@@ -17,7 +17,6 @@ use Market::Panels::PricePanel;
 use Market::Panels::ATRPanel;
 use Market::ChartEngine;
 use Market::OverlayManager;
-use Market::Overlays::DemoOverlay;
 use Market::Replay;
 
 # --- Fase 2: motores analiticos y overlays SMC / Liquidez (Tabla 1) ---
@@ -90,43 +89,71 @@ my $canvas_atr = $mw->Canvas(
 # =============================================================================
 # DATOS
 # =============================================================================
-print "Cargando datos...\n";
 my $market = Market::MarketData->new;
 
-my $csv_path;
-for my $cand ('data/2026_03.csv', '2026_03.csv', '../data/2026_03.csv') {
-    if (-f $cand) { $csv_path = $cand; last; }
-}
-die "No se encuentra 2026_03.csv\n" unless $csv_path;
+# Los tres archivos del proyecto en orden cronologico.
+# 2026_03.csv es un archivo con nombre incorrecto que contiene datos de Abril;
+# se usa como fallback de 2026_04.csv si este no existe (son identicos).
+# Se salta cualquier vela con timestamp <= al ultimo ya cargado para evitar
+# duplicados en caso de que los archivos se solapen.
+my @csv_groups = (
+    ['data/2026_04.csv', '2026_04.csv', '../data/2026_04.csv',
+     'data/2026_03.csv', '2026_03.csv', '../data/2026_03.csv'],
+    ['data/2026_05.csv', '2026_05.csv', '../data/2026_05.csv'],
+    ['data/2026_06_29.csv', '2026_06_29.csv', '../data/2026_06_29.csv'],
+);
 
-open my $fh, '<', $csv_path or die "Error abriendo CSV '$csv_path': $!\n";
-<$fh>;
-my $count = 0;
-while (<$fh>) {
-    chomp;
-    my ($time_str, $open, $high, $low, $close, $volume) = split /,/;
-    next unless defined $close && $close ne '';
-    my $tm;
-    eval { $tm = Time::Moment->from_string($time_str) };
-    next if $@;
-    $market->add_candle({
-        time   => $time_str,
-        ts     => $tm->epoch,
-        open   => $open  + 0,
-        high   => $high  + 0,
-        low    => $low   + 0,
-        close  => $close + 0,
-        volume => $volume + 0,
-    });
-    $count++;
+my $count    = 0;
+my $last_ts  = 0;
+
+for my $paths (@csv_groups) {
+    my $csv_path;
+    for my $cand (@$paths) {
+        if (-f $cand) { $csv_path = $cand; last; }
+    }
+    unless ($csv_path) {
+        my $name = (grep { !m{/\.\.} } @$paths)[0] // $paths->[0];
+        warn "CSV no encontrado (se continua sin el): $name\n";
+        next;
+    }
+
+    print "Cargando $csv_path...\n";
+    open my $fh, '<', $csv_path or die "Error abriendo CSV '$csv_path': $!\n";
+    <$fh>;   # saltar cabecera
+    while (<$fh>) {
+        chomp;
+        my ($time_str, $open, $high, $low, $close, $volume) = split /,/;
+        next unless defined $close && $close ne '';
+        my $tm;
+        eval { $tm = Time::Moment->from_string($time_str) };
+        next if $@;
+        my $ts = $tm->epoch;
+        next if $ts <= $last_ts;   # saltar duplicados / datos fuera de orden
+        $last_ts = $ts;
+        $market->add_candle({
+            time   => $time_str,
+            ts     => $ts,
+            open   => $open  + 0,
+            high   => $high  + 0,
+            low    => $low   + 0,
+            close  => $close + 0,
+            volume => $volume + 0,
+        });
+        $count++;
+    }
+    close $fh;
 }
-close $fh;
 
 printf "Cargadas %d velas de 1m\n", $count;
 $market->build_timeframes;
-printf "5m: %d  |  15m: %d\n",
+printf "5m: %d | 15m: %d | 1h: %d | 2h: %d | 4h: %d | D: %d | W: %d\n",
     scalar @{ $market->get_data->{'5m'} },
-    scalar @{ $market->get_data->{'15m'} };
+    scalar @{ $market->get_data->{'15m'} },
+    scalar @{ $market->get_data->{'1h'} },
+    scalar @{ $market->get_data->{'2h'} },
+    scalar @{ $market->get_data->{'4h'} },
+    scalar @{ $market->get_data->{'D'} },
+    scalar @{ $market->get_data->{'W'} };
 
 # =============================================================================
 # INDICADORES
