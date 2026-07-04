@@ -82,8 +82,9 @@ sub new {
     my $self = {
         k            => $args{k}            // 3,
         eq_factor    => $args{eq_factor}    // 0.10,
-        grab_window  => $args{grab_window}  // 3,
-        acceptance_n => $args{acceptance_n} // 10,
+        grab_window  => $args{grab_window}  // 2,
+        acceptance_n => $args{acceptance_n} // 5,
+        atr_factor   => $args{atr_factor}   // 0.30,
         atr          => $args{atr},   # referencia DIRECTA al objeto ATR
 
         swings => [],   # todos los swings confirmados, en orden de confirmacion
@@ -207,6 +208,33 @@ sub _evaluate_swing_candidate {
         last if !$is_high && !$is_low;
     }
 
+    # ---- Filtro de prominencia por ATR ----
+    # Un swing es significativo si su "altura" sobre el contexto supera
+    # atr_factor * ATR[c]. Elimina swings minusculos en rangos laterales
+    # que generan etiquetas de liquidez ruidosas.
+    if ($is_high || $is_low) {
+        my $atr_vals = $self->{atr} ? $self->{atr}->get_values : undef;
+        my $atr_val  = ($atr_vals && defined $atr_vals->[$c]) ? $atr_vals->[$c] : 0;
+        my $min_prom = $atr_val * $self->{atr_factor};
+
+        if ($is_high && $min_prom > 0) {
+            my $ctx_low = $candle->{low};
+            for my $j (($c - $k) .. ($c + $k)) {
+                my $o = $market_data->get_candle($j) or next;
+                $ctx_low = $o->{low} if $o->{low} < $ctx_low;
+            }
+            $is_high = 0 if ($candle->{high} - $ctx_low) < $min_prom;
+        }
+        if ($is_low && $min_prom > 0) {
+            my $ctx_high = $candle->{high};
+            for my $j (($c - $k) .. ($c + $k)) {
+                my $o = $market_data->get_candle($j) or next;
+                $ctx_high = $o->{high} if $o->{high} > $ctx_high;
+            }
+            $is_low = 0 if ($ctx_high - $candle->{low}) < $min_prom;
+        }
+    }
+
     $self->_register_swing( 'H', $market_data, $candle, $c ) if $is_high;
     $self->_register_swing( 'L', $market_data, $candle, $c ) if $is_low;
 }
@@ -227,7 +255,32 @@ sub _register_swing {
     push @{ $self->{swings} }, $swing;
 
     my $level = $self->_register_level( $kind, $swing, $market_data );
-    push @{ $self->{_open_level_refs} }, $level;
+
+    # ---- Anti-duplicado de niveles (working set, no el historico) ----
+    # $level ya fue agregado a $self->{levels} dentro de _register_level
+    # (eso NO se toca: cada swing siempre genera su registro historico).
+    # Lo que se evita aqui es agregarlo al WORKING SET (_open_level_refs)
+    # si ya existe un nivel DETECTED/SWEPT del mismo lado a menos de
+    # 2*eq_factor*ATR de distancia -- eso es lo que produce eventos
+    # Sweep/Grab duplicados casi identicos cuando varios swings muy
+    # cercanos son barridos por el mismo movimiento de precio.
+    my $is_duplicate = 0;
+    {
+        my $atr_vals = $self->{atr} ? $self->{atr}->get_values : undef;
+        my $atr_v    = ($atr_vals && @$atr_vals) ? ($atr_vals->[-1] // 0) : 0;
+        my $tol      = $atr_v * ($self->{eq_factor} * 2.0);
+        if ($tol > 0) {
+            for my $existing (@{ $self->{_open_level_refs} }) {
+                if ($existing->{side} eq $level->{side}
+                    && abs($existing->{price} - $level->{price}) <= $tol)
+                {
+                    $is_duplicate = 1;
+                    last;
+                }
+            }
+        }
+    }
+    push @{ $self->{_open_level_refs} }, $level unless $is_duplicate;
 
     $self->_check_equal_levels( $kind, $swing );
 }

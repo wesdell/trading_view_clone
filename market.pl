@@ -166,7 +166,7 @@ my $ind_manager = Market::IndicatorManager->new;
 my $atr_ind = Market::Indicators::ATR->new(14);
 my $liq_ind = Market::Indicators::Liquidity->new( atr => $atr_ind, k => 3 );
 my $smc_ind = Market::Indicators::SMC_Structures->new(
-    liquidity => $liq_ind, max_age => 50 );
+    liquidity => $liq_ind, atr => $atr_ind, max_age => 50 );
 
 $ind_manager->register('atr',       $atr_ind);
 $ind_manager->register('liquidity', $liq_ind);
@@ -589,19 +589,19 @@ my $make_chk = sub {
 };
 
 # =============================================================================
-# Columna SMC STRUCTURES (BOS / CHoCH / FVG)
+# Columna SMC STRUCTURES (Estructura HH/HL/LH/LL / BOS / CHoCH / FVG / OB)
 # =============================================================================
-my %SMC = ( show_fvg => 0, show_bos => 0, show_choch => 0 );
+my %SMC = ( show_struct => 0, show_fvg => 0, show_bos => 0, show_choch => 0, show_obs => 0 );
 my $smc_master = 0;
 my $refresh_smc = sub {
     $smc_overlay->set_flag($_, $SMC{$_}) for keys %SMC;
-    my $any = ( $SMC{show_fvg} || $SMC{show_bos} || $SMC{show_choch} ) ? 1 : 0;
-    $overlay_mgr->set_visible('smc', $any);
+    my $any = 0; $any ||= $SMC{$_} for keys %SMC;
+    $overlay_mgr->set_visible('smc', $any ? 1 : 0);
     $engine->request_render;
 };
 my $sync_smc_master = sub {
-    $smc_master =
-        ( $SMC{show_fvg} && $SMC{show_bos} && $SMC{show_choch} ) ? 1 : 0;
+    my $all = 1; $all &&= $SMC{$_} for keys %SMC;
+    $smc_master = $all ? 1 : 0;
 };
 my $leaf_smc = sub { $refresh_smc->(); $sync_smc_master->(); };
 
@@ -610,9 +610,11 @@ $make_chk->($col_smc, 'Activar SMC', \$smc_master, sub {
     $SMC{$_} = $smc_master for keys %SMC;   # master = encender/apagar TODO SMC
     $refresh_smc->();
 });
+$make_chk->($col_smc, 'Estructura (HH/HL/LH/LL)', \$SMC{show_struct}, $leaf_smc);
 $make_chk->($col_smc, 'BOS',       \$SMC{show_bos},   $leaf_smc);
 $make_chk->($col_smc, 'CHoCH',     \$SMC{show_choch}, $leaf_smc);
 $make_chk->($col_smc, 'FVG',       \$SMC{show_fvg},   $leaf_smc);
+$make_chk->($col_smc, 'Order Blocks', \$SMC{show_obs}, $leaf_smc);
 
 # =============================================================================
 # Columna LIQUIDITY (Swing / BSL / SSL / EQH / EQL / Sweeps / Grabs / Runs)
