@@ -40,6 +40,24 @@ use constant GMT_OFFSET_MIN => -300;
 # (especialmente 2h y 4h) a medianoche local en vez de UTC.
 use constant LOCAL_OFFSET_SEC => 5 * 3600;
 
+# Temporalidades "a partir de 2h" (2h, 4h, D, W): en estas, sabado y domingo
+# NO se cuentan (mercado de futuros; solo lunes-viernes). Las intradia menores
+# (5m/15m/1h) NO se filtran. Ver build_tf_candles.
+my %WEEKEND_SKIP_TF = map { $_ => 1 } qw(2h 4h D W);
+
+# -----------------------------------------------------------------------------
+# _dow_local (privado)
+# Dia de la semana ISO (1=Lunes .. 7=Domingo) del ts en hora LOCAL (UTC-5),
+# calculado de forma barata desde el epoch (sin crear Time::Moment por vela).
+# El dia 0 del epoch Unix (1970-01-01) fue Jueves (=4 ISO).
+# -----------------------------------------------------------------------------
+sub _dow_local {
+    my ($ts) = @_;
+    my $days = int( ( $ts - LOCAL_OFFSET_SEC ) / 86400 );
+    $days -= 1 if ( $ts - LOCAL_OFFSET_SEC ) < 0 && ( $ts - LOCAL_OFFSET_SEC ) % 86400 != 0;
+    return ( ( $days % 7 ) + 3 ) % 7 + 1;
+}
+
 # -----------------------------------------------------------------------------
 # new
 # -----------------------------------------------------------------------------
@@ -131,10 +149,18 @@ sub build_tf_candles {
     return unless exists $TF_MINUTES{$tf} || $tf eq 'D' || $tf eq 'W';
 
     my $src = $self->{data}{'1m'};
+    my $skip_weekend = $WEEKEND_SKIP_TF{$tf};   # 2h/4h/D/W: sin sabado/domingo
     my @result;
     my $current_candle = undef;
+    my $first_dow;                               # dia de la 1ra vela util (para W)
 
     for my $c (@$src) {
+        if ($skip_weekend) {
+            my $dow = _dow_local($c->{ts});
+            next if $dow == 6 || $dow == 7;      # 6=Sabado, 7=Domingo -> no cuentan
+        }
+        $first_dow //= _dow_local($c->{ts});
+
         my $bucket_ts = $self->_bucket_ts_for($c->{ts}, $tf);
 
         if (!defined $current_candle || $current_candle->{ts} != $bucket_ts) {
@@ -158,6 +184,17 @@ sub build_tf_candles {
     }
 
     push @result, $current_candle if defined $current_candle;
+
+    # W: descartar la SEMANA PARCIAL inicial. Si los datos empiezan a mitad de
+    # semana (p.ej. miercoles 1-abr), la 1ra vela semanal quedaria anclada al
+    # lunes anterior (sin datos ese lunes/martes) -> es una semana incompleta.
+    # Se elimina para que la primera vela semanal sea el primer LUNES real
+    # (p.ej. lunes 6-abr). Requisito del usuario: la semana va lunes->domingo y
+    # arranca en lunes.
+    if ($tf eq 'W' && @result && defined $first_dow && $first_dow != 1) {
+        shift @result;
+    }
+
     $self->{data}{$tf} = \@result;
 }
 
