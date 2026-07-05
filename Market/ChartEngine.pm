@@ -4,6 +4,7 @@ use strict;
 use warnings;
 use POSIX qw(floor);
 use Market::Panels::Scales;
+use Market::Overlays::LabelPlacer;
 
 use constant {
     MIN_BARS       => 2,
@@ -65,6 +66,14 @@ sub new {
         _cb_mode_price => undef,
         _cb_mode_atr   => undef,
 
+        # Modo "seleccionar vela" (iniciar Replay con clic en vez de TextField)
+        _pick_mode => 0,
+        _pick_cb   => undef,
+
+        # Marcador visual del punto de inicio del Replay (linea + fecha/hora)
+        _replay_start_index => undef,
+        _replay_start_label => undef,
+
         # Drag en regleta Y
         _scale_drag_panel   => undef,
         _scale_drag_start_y => undef,
@@ -107,6 +116,63 @@ sub _notify_mode_price {
 sub _notify_mode_atr {
     my ( $self, $is_free ) = @_;
     $self->{_cb_mode_atr}->($is_free) if $self->{_cb_mode_atr};
+}
+
+# -----------------------------------------------------------------------------
+# begin_candle_pick / cancel_candle_pick / is_picking
+# Modo "seleccionar vela": mientras esta activo, el proximo clic izquierdo
+# sobre el panel de precio NO arrastra el grafico; en su lugar mapea la X del
+# clic a un indice de vela (mismo mapeo X->indice que usa el crosshair) y llama
+# $cb->($index, $candle). Lo usa la barra de Replay para elegir la vela de
+# inicio con un clic. Un clic fuera del area de velas NO inicia y mantiene el
+# modo activo. Cambia el cursor a 'crosshair' como pista visual.
+# -----------------------------------------------------------------------------
+sub begin_candle_pick {
+    my ( $self, $cb ) = @_;
+    $self->{_pick_mode} = 1;
+    $self->{_pick_cb}   = $cb;
+    eval { $self->{canvas_price}->configure( -cursor => 'crosshair' ) };
+}
+
+sub cancel_candle_pick {
+    my ($self) = @_;
+    return unless $self->{_pick_mode};
+    $self->{_pick_mode} = 0;
+    $self->{_pick_cb}   = undef;
+    eval { $self->{canvas_price}->configure( -cursor => '' ) };
+}
+
+sub is_picking { return $_[0]->{_pick_mode} ? 1 : 0; }
+
+# -----------------------------------------------------------------------------
+# set_replay_start_marker / clear_replay_start_marker
+# Marca en el grafico la vela desde la que arranco el Replay: una linea
+# vertical + un label con su fecha/hora. Sirve como confirmacion visual de que
+# el replay inicia EXACTAMENTE en la vela elegida con el clic (el indice es
+# global en la TF activa; se limpia al salir del replay o cambiar de TF).
+# -----------------------------------------------------------------------------
+sub set_replay_start_marker {
+    my ( $self, $index, $label ) = @_;
+    $self->{_replay_start_index} = $index;
+    $self->{_replay_start_label} = $label;
+
+    # Encuadre (spec 18): la vela de inicio queda al borde IZQUIERDO, con un
+    # pequeno margen, y el espacio a la derecha se ira llenando conforme avanza
+    # el replay. follow_replay_pointer respeta este offset mientras el puntero
+    # siga dentro de la ventana (solo hace scroll cuando se sale por la derecha).
+    my $pad = 3;
+    $self->{offset} = $index - $pad;
+
+    $self->request_render;
+}
+
+sub clear_replay_start_marker {
+    my ($self) = @_;
+    return unless defined $self->{_replay_start_index};
+    $self->{_replay_start_index} = undef;
+    $self->{_replay_start_label} = undef;
+    $self->{canvas_price}->delete('replay_marker');
+    $self->request_render;
 }
 
 # -----------------------------------------------------------------------------
@@ -326,14 +392,87 @@ sub render {
     # construido arriba -- nunca crean una escala propia. $self->{overlays}
     # es opcional para no romper compatibilidad si algun consumidor de
     # ChartEngine no lo provee.
-    $self->{overlays}->render_all( $self->{canvas_price}, $scale_price )
-        if $self->{overlays};
+    #
+    # Anti-solape de etiquetas: se crea un LabelPlacer sembrado con las cajas
+    # (cuerpo+mecha) de las velas visibles como OBSTACULOS. Los overlays encolan
+    # sus etiquetas en el placer en vez de dibujarlas al vuelo; al final se
+    # llama flush() para colocarlas evitando velas y otras etiquetas, por orden
+    # de prioridad. Se borran las etiquetas del frame anterior antes de encolar.
+    $self->{canvas_price}->delete('labels');
+    my $placer;
+    if ( $self->{overlays} ) {
+        my $bar_w = $scale_price->_plot_w / $scale_price->{visible_bars};
+        my $hw    = $bar_w / 2 + 1;
+        my @obst;
+        my $gi = $islice_start;
+        for my $c (@$visible_candles) {
+            my $cx = $scale_price->index_to_center_x($gi);
+            push @obst, [
+                $cx - $hw, $scale_price->value_to_y( $c->{high} ),
+                $cx + $hw, $scale_price->value_to_y( $c->{low} ),
+            ];
+            $gi++;
+        }
+        $placer = Market::Overlays::LabelPlacer->new(
+            obstacles => \@obst,
+            plot_w    => $scale_price->_plot_w,
+            plot_h    => $canv_ph,
+        );
+        $self->{overlays}->render_all( $self->{canvas_price}, $scale_price, $placer );
+    }
+
+    # Z-order: las ZONAS de FVG y OB deben quedar DETRAS de las velas (no
+    # taparlas). Los overlays se dibujan despues de las velas, asi que aqui se
+    # empujan sus rectangulos por debajo del tag 'candle'. Se baja FVG primero y
+    # OB despues -> orden final (de atras a adelante): FVG, OB, velas; asi el OB
+    # mantiene prioridad visual sobre el FVG (spec 18/29). Los chips y lineas
+    # estructurales/liquidez (otros tags) permanecen al frente. Se protege con
+    # if/eval por si el tag de referencia aun no existe en un frame vacio.
+    my $cpz = $self->{canvas_price};
+    my @candle_ids = $cpz->find( withtag => 'candle' );
+    if (@candle_ids) {
+        eval { $cpz->lower( 'smc_fvg_zone', 'candle' ) };
+        eval { $cpz->lower( 'smc_ob_zone',  'candle' ) };
+    }
+
+    # Colocar TODAS las etiquetas encoladas (por encima de velas/lineas),
+    # resolviendo colisiones contra velas y entre si segun prioridad.
+    $placer->flush( $self->{canvas_price}, 'labels' ) if $placer;
 
     $self->{price_panel}->render_last_visible_price( $self->{canvas_price} );
 
     my $anchors = $self->compute_intraday_labels( $islice_start, $islice_end );
     $self->{price_panel}->draw_time_axis( $self->{canvas_price}, $anchors );
     $self->{price_panel}->_init_crosshair_objects;
+
+    # Marcador de inicio de Replay (linea vertical + fecha/hora de la vela).
+    $self->{canvas_price}->delete('replay_marker');
+    if ( defined $self->{_replay_start_index} ) {
+        my $si = $self->{_replay_start_index};
+        if ( $si >= $islice_start && $si <= $islice_end ) {
+            my $mx = $scale_price->index_to_center_x($si);
+            $self->{canvas_price}->createLine(
+                $mx, 0, $mx, $canv_ph,
+                -fill => '#8e24aa', -width => 1, -dash => [3, 3],
+                -tags => ['replay_marker'] );
+            if ( defined $self->{_replay_start_label} ) {
+                my $tid = $self->{canvas_price}->createText(
+                    $mx + 4, 6,
+                    -text   => 'Inicio replay: ' . $self->{_replay_start_label},
+                    -anchor => 'nw', -fill => '#8e24aa',
+                    -font   => 'TkDefaultFont 8 bold',
+                    -tags   => ['replay_marker'] );
+                my @bb = $self->{canvas_price}->bbox($tid);
+                if (@bb) {
+                    my $rid = $self->{canvas_price}->createRectangle(
+                        $bb[0] - 2, $bb[1] - 1, $bb[2] + 2, $bb[3] + 1,
+                        -fill => '#ffffff', -outline => '#8e24aa',
+                        -tags => ['replay_marker'] );
+                    $self->{canvas_price}->lower( $rid, $tid );
+                }
+            }
+        }
+    }
 
     $self->{canvas_atr}->delete('atr_all');
     $self->{canvas_atr}->delete('scale_bg');
@@ -520,6 +659,22 @@ sub bind_events {
     $toplevel->bind( '<ButtonPress-1>', sub {
         my $ev = $_[0]->XEvent;
         my ( $panel, $lx, $ly ) = $hit_test->( $ev->X, $ev->Y );
+
+        # --- Modo seleccion de vela (Replay): el clic elige la vela y NO
+        #     arrastra el grafico. Fuera del area de velas no inicia. ---
+        if ( $self->{_pick_mode} ) {
+            if ( defined $panel && $panel eq 'price' && $self->{_scale_price} ) {
+                my $idx = $self->{_scale_price}->x_to_index($lx);
+                my $c   = $self->{market}->get_candle($idx);
+                if ($c) {
+                    my $cb = $self->{_pick_cb};
+                    $self->cancel_candle_pick;
+                    $cb->( $idx, $c ) if $cb;
+                }
+            }
+            return;   # traga el clic mientras se selecciona
+        }
+
         return unless defined $panel;
 
         # --- Drag en regleta Y de precios: activa modo manual precio ---
@@ -782,6 +937,12 @@ sub bind_events {
     # ESC: borra AMBAS marcas persistentes
     # =========================================================================
     $toplevel->bind( '<Escape>', sub {
+        # Escape tambien aborta la seleccion de vela del Replay, si esta activa.
+        if ( $self->{_pick_mode} ) {
+            my $cb = $self->{_pick_cb};
+            $self->cancel_candle_pick;
+            $cb->( undef, undef ) if $cb;   # avisa a la UI que se cancelo
+        }
         $self->{_price_cross} = undef;
         $self->{_atr_cross}   = undef;
         $self->{canvas_price}->delete('price_cross');
@@ -1161,6 +1322,11 @@ sub set_timeframe {
     $self->{indicators}->reset_all;
     $self->{indicators}->rebuild_all( $self->{market} );
 
+    # El indice del marcador de inicio es relativo a la TF anterior: invalidarlo.
+    $self->{_replay_start_index} = undef;
+    $self->{_replay_start_label} = undef;
+    $self->{canvas_price}->delete('replay_marker');
+
     $self->{_free_mode_price} = 0;
     $self->{_free_mode_atr}   = 0;
     $self->{zoom_y_auto}      = 1;
@@ -1207,7 +1373,27 @@ sub follow_replay_pointer {
     my $total = $self->{market}->size;
     return if $total <= 0;
 
-    $self->{offset} = $total - $self->{visible_bars};
+    my $ptr        = $total - 1;                       # ultima vela del replay
+    my $bars       = $self->{visible_bars};
+    my $right_edge = $self->{offset} + $bars - 1;
+
+    # Politica de encuadre tipo TradingView:
+    #  - Al ARRANCAR (o retroceder), el puntero cae a la IZQUIERDA de la ventana
+    #    actual -> se reencuadra con el puntero al borde izquierdo y espacio
+    #    vacio a la derecha que se ira llenando al avanzar (spec 18).
+    #  - Mientras el puntero avanza DENTRO de la ventana, el offset NO se toca
+    #    (la vela seleccionada se mantiene a la izquierda y el grafico se llena
+    #    hacia la derecha).
+    #  - Cuando el puntero se sale por la DERECHA, recien ahi se hace scroll
+    #    para mantenerlo a la vista.
+    if ( $ptr < $self->{offset} ) {
+        $self->{offset} = $ptr;                        # puntero al borde izquierdo
+    }
+    elsif ( $ptr > $right_edge ) {
+        $self->{offset} = $ptr - ( $bars - 1 );        # puntero al borde derecho
+    }
+    # else: dentro de la ventana -> no mover (se llena hacia la derecha).
+
     $self->request_render;
 }
 

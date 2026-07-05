@@ -80,10 +80,19 @@ use warnings;
 sub new {
     my ( $class, %args ) = @_;
     my $self = {
-        k            => $args{k}            // 3,
-        eq_factor    => $args{eq_factor}    // 0.10,
+        k              => $args{k}              // 3,
+        eq_factor      => $args{eq_factor}      // 0.10,
+        eq_lookback    => $args{eq_lookback}    // 50,
+        max_open_levels => $args{max_open_levels} // 150,
+        track_volume    => defined $args{track_volume} ? $args{track_volume} : 1,
         grab_window  => $args{grab_window}  // 2,
         acceptance_n => $args{acceptance_n} // 5,
+        # Ventana de CONTINUACION: tras un reclamo (cierre de vuelta dentro que
+        # seria GRAB/SWEEP) se esperan estas velas; si el precio vuelve a romper
+        # y continua en la direccion del barrido, se reclasifica como RUN
+        # (corrige "grabs que en realidad eran LQ RUN"). 0 = resolver de
+        # inmediato (comportamiento anterior).
+        continuation_window => $args{continuation_window} // 3,
         atr_factor   => $args{atr_factor}   // 0.30,
         atr          => $args{atr},   # referencia DIRECTA al objeto ATR
 
@@ -92,14 +101,17 @@ sub new {
         equals => [],   # pares EQH/EQL (puramente geometrico, no es un "nivel")
         events => [],   # eventos Sweep/Grab/Run ya resueltos
 
-        # FIX-1: indices separados por tipo para O(1) en last_swing_high/low
-        # y para _check_equal_levels sin iterar toda la lista mezclada.
-        _swings_H => [],
-        _swings_L => [],
-
         _open_level_refs      => [],   # niveles en DETECTED o SWEPT (working set)
         _next_id               => 1,
         _last_evaluated_index  => -1,  # ultimo candidato de swing ya evaluado
+
+        # Agregados del working set para el FAST-SKIP de la maquina de estados
+        # (ver _update_state_machine). Permiten saltar en O(1) las velas en las
+        # que ningun nivel puede transicionar, sin recorrer los ~150 niveles.
+        _ws_dirty    => 1,      # los agregados necesitan recomputo
+        _ws_min_buy  => 9e18,   # menor precio entre DETECTED buy  (+inf si no hay)
+        _ws_max_sell => -9e18,  # mayor precio entre DETECTED sell (-inf si no hay)
+        _ws_active   => 0,      # nº de niveles SWEPT/RECLAIMED pendientes
     };
 
     die "Market::Indicators::Liquidity: acceptance_n debe ser > grab_window "
@@ -119,11 +131,13 @@ sub reset {
     $self->{levels} = [];
     $self->{equals} = [];
     $self->{events} = [];
-    $self->{_swings_H}            = [];
-    $self->{_swings_L}            = [];
     $self->{_open_level_refs}     = [];
     $self->{_next_id}             = 1;
     $self->{_last_evaluated_index} = -1;
+    $self->{_ws_dirty}    = 1;
+    $self->{_ws_min_buy}  = 9e18;
+    $self->{_ws_max_sell} = -9e18;
+    $self->{_ws_active}   = 0;
 }
 
 # -----------------------------------------------------------------------------
@@ -137,12 +151,18 @@ sub get_events { return $_[0]->{events}; }
 
 sub last_swing_high {
     my ($self) = @_;
-    return $self->{_swings_H}[-1];   # FIX-2: O(1)
+    for my $sw ( reverse @{ $self->{swings} } ) {
+        return $sw if $sw->{kind} eq 'H';
+    }
+    return undef;
 }
 
 sub last_swing_low {
     my ($self) = @_;
-    return $self->{_swings_L}[-1];   # FIX-2: O(1)
+    for my $sw ( reverse @{ $self->{swings} } ) {
+        return $sw if $sw->{kind} eq 'L';
+    }
+    return undef;
 }
 
 sub side_label {
@@ -254,14 +274,48 @@ sub _register_swing {
         price => ( $kind eq 'H' ? $candle->{high} : $candle->{low} ),
     };
     push @{ $self->{swings} }, $swing;
-    push @{ $self->{ $kind eq 'H' ? '_swings_H' : '_swings_L' } }, $swing;  # FIX-3
 
     my $level = $self->_register_level( $kind, $swing, $market_data );
 
-    # FIX-4: El anti-duplicado O(n) se elimino (era el 2o mayor cuello de
-    # botella). El cap OPEN_LEVEL_CAP en _update_state_machine hace innecesario
-    # filtrar aqui: los niveles viejos nunca acumulados ya se descartan ahi.
-    push @{ $self->{_open_level_refs} }, $level;
+    # ---- Anti-duplicado de niveles (working set, no el historico) ----
+    # $level ya fue agregado a $self->{levels} dentro de _register_level
+    # (eso NO se toca: cada swing siempre genera su registro historico).
+    # Lo que se evita aqui es agregarlo al WORKING SET (_open_level_refs)
+    # si ya existe un nivel DETECTED/SWEPT del mismo lado a menos de
+    # 2*eq_factor*ATR de distancia -- eso es lo que produce eventos
+    # Sweep/Grab duplicados casi identicos cuando varios swings muy
+    # cercanos son barridos por el mismo movimiento de precio.
+    my $is_duplicate = 0;
+    {
+        my $atr_vals = $self->{atr} ? $self->{atr}->get_values : undef;
+        my $atr_v    = ($atr_vals && @$atr_vals) ? ($atr_vals->[-1] // 0) : 0;
+        my $tol      = $atr_v * ($self->{eq_factor} * 2.0);
+        if ($tol > 0) {
+            for my $existing (@{ $self->{_open_level_refs} }) {
+                if ($existing->{side} eq $level->{side}
+                    && abs($existing->{price} - $level->{price}) <= $tol)
+                {
+                    $is_duplicate = 1;
+                    last;
+                }
+            }
+        }
+    }
+    push @{ $self->{_open_level_refs} }, $level unless $is_duplicate;
+
+    # Cap del working set: los niveles DETECTED muy antiguos (lejos en el
+    # tiempo) casi nunca se barren y solo encarecen el escaneo por vela. Se
+    # conservan los mas recientes (los SWEPT se resuelven en pocas velas, asi
+    # que quedan al final; el frente son DETECTED viejos). Escaneo acotado a
+    # max_open_levels por vela en vez de O(n) creciente.
+    my $refs = $self->{_open_level_refs};
+    if ( @$refs > $self->{max_open_levels} ) {
+        splice( @$refs, 0, @$refs - $self->{max_open_levels} );
+    }
+
+    # El working set cambio (nuevo nivel / cap): los agregados del fast-skip
+    # deben recomputarse antes de la proxima evaluacion de la maquina de estados.
+    $self->{_ws_dirty} = 1;
 
     $self->_check_equal_levels( $kind, $swing );
 }
@@ -290,7 +344,8 @@ sub _register_level {
         volumes   => { '1m' => 0, '5m' => 0, '15m' => 0 },
     };
 
-    $self->_attach_multi_tf_volume( $level, $swing, $market_data ) if $market_data;
+    $self->_attach_multi_tf_volume( $level, $swing, $market_data )
+        if $market_data && $self->{track_volume};
 
     push @{ $self->{levels} }, $level;
     return $level;
@@ -346,14 +401,16 @@ sub is_internal {
 
 # -----------------------------------------------------------------------------
 # _check_equal_levels (privado)
-# Compara el swing recien confirmado contra TODOS los swings previos del
-# mismo tipo. Cada par dentro de tolerancia genera una entrada en
-# get_equals() (puramente geometrica/informativa, no crea un nivel nuevo
-# ni afecta la maquina de estados del nivel ya registrado por el swing).
+# Empareja el swing recien confirmado con el swing previo MAS RECIENTE del
+# mismo tipo que este dentro de tolerancia, y crea UN solo par EQH/EQL.
+#
+# Antes se comparaba contra TODOS los previos y se creaba un par por cada uno
+# -> N lineas/etiquetas solapadas sobre la misma zona (ruido, spec 12). Al
+# encadenar solo con el vecino inmediato, varios maximos/minimos "iguales"
+# consecutivos forman un unico cluster horizontal limpio en lugar de una
+# maraña de segmentos cruzados. (Puramente geometrico: no crea un nivel nuevo
+# ni afecta la maquina de estados del nivel ya registrado por el swing.)
 # -----------------------------------------------------------------------------
-# Ventana maxima para EQH/EQL: mas alla de 500 velas no es relevante
-use constant EQ_WINDOW => 500;
-
 sub _check_equal_levels {
     my ( $self, $kind, $new_swing ) = @_;
     return unless $self->{atr};
@@ -366,15 +423,24 @@ sub _check_equal_levels {
 
     my $tolerance = $atr_at_new * $self->{eq_factor};
 
-    # FIX-5: usa el indice tipado (_swings_H o _swings_L) e itera en reversa
-    # con salida temprana por ventana => O(EQ_WINDOW) en vez de O(n_total)
-    my $typed   = $self->{ $kind eq 'H' ? '_swings_H' : '_swings_L' };
-    my $min_idx = $new_swing->{index} - EQ_WINDOW;
-
-    for my $prev ( reverse @$typed ) {
-        last if $prev->{index} < $min_idx;   # salida temprana
+    # Recorrer de mas reciente a mas antiguo y detenerse en el primer swing
+    # del mismo tipo dentro de tolerancia. Se limita la busqueda a los ultimos
+    # eq_lookback swings: los EQH/EQL son un fenomeno LOCAL (maximos/minimos
+    # cercanos en el tiempo) y ademas evita el coste O(n^2) de escanear todo el
+    # historico cuando un swing no tiene par (lo que congelaba el rebuild del
+    # replay en datasets grandes).
+    my $swings   = $self->{swings};
+    my $lookback = $self->{eq_lookback};
+    my $stop     = $#$swings - $lookback;
+    $stop = 0 if $stop < 0;
+    for (my $j = $#$swings; $j >= $stop; $j--) {
+        my $prev = $swings->[$j];
         next if $prev->{id} == $new_swing->{id};
-        next if abs( $prev->{price} - $new_swing->{price} ) > $tolerance;
+        next unless $prev->{kind} eq $kind;
+
+        my $diff = abs( $prev->{price} - $new_swing->{price} );
+        next if $diff > $tolerance;
+
         push @{ $self->{equals} }, {
             kind => ( $kind eq 'H' ? 'EQH' : 'EQL' ),
             i1   => $prev->{index},
@@ -382,6 +448,7 @@ sub _check_equal_levels {
             p1   => $prev->{price},
             p2   => $new_swing->{price},
         };
+        last;   # solo el vecino igual mas cercano -> una sola zona
     }
 }
 
@@ -389,89 +456,143 @@ sub _check_equal_levels {
 # MAQUINA DE ESTADOS: Detected -> Swept -> (Acceptance|Reclaimed) -> Resolved
 # =============================================================================
 
-# Maximo de niveles activos en el working set. Los niveles mas antiguos
-# que siguen sin barrerse son structuralmente irrelevantes (el precio lleva
-# cientos de velas sin acercarse a ellos) y solo consumen CPU en cada vela.
-use constant OPEN_LEVEL_CAP => 80;
-
+# La logica de sweep (Detected->Swept) y de resolucion (Swept->Grab/Sweep/Run)
+# esta INLINE en el bucle por rendimiento: se evalua una vez por nivel abierto
+# y por vela (millones de veces en datasets grandes), y evitar el coste de la
+# llamada a metodo por iteracion reduce drasticamente el tiempo de rebuild
+# (arranque de la app y entrada/salida de replay). El comportamiento es
+# identico al de los antiguos _check_sweep/_check_resolution.
 sub _update_state_machine {
     my ( $self, $market_data, $i ) = @_;
     my $candle = $market_data->get_candle($i);
     return unless $candle;
 
+    my $ch = $candle->{high};
+    my $cl = $candle->{low};
+
+    # Si el working set cambio desde el ultimo escaneo (nuevo nivel / cap),
+    # recomputar los agregados que gobiernan el fast-skip.
+    $self->_recompute_ws_aggregates if $self->{_ws_dirty};
+
+    # ---- FAST-SKIP (O(1)) ----------------------------------------------------
+    # Ningun nivel puede transicionar en esta vela cuando:
+    #   * no hay niveles SWEPT/RECLAIMED pendientes (esos dependen del tiempo y
+    #     hay que revisarlos cada vela), y
+    #   * el maximo de la vela no supera el DETECTED buy mas bajo (un buy solo
+    #     se barre si ch > su precio), y
+    #   * el minimo de la vela no perfora el DETECTED sell mas alto (un sell
+    #     solo se barre si cl < su precio).
+    # En ese caso se evita recorrer los ~150 niveles del working set. Es
+    # EXACTAMENTE equivalente al escaneo completo (que no habria producido
+    # ninguna transicion ni evento).
+    return if $self->{_ws_active} == 0
+           && $ch <= $self->{_ws_min_buy}
+           && $cl >= $self->{_ws_max_sell};
+
+    my $cc = $candle->{close};
+    my $gw = $self->{grab_window};
+    my $an = $self->{acceptance_n};
+    my $cw = $self->{continuation_window};
+
+    # Se reconstruye el working set y, en la misma pasada, los agregados del
+    # fast-skip segun el estado RESULTANTE de cada nivel.
     my @still_open;
+    my $min_buy  = 9e18;
+    my $max_sell = -9e18;
+    my $active   = 0;
     for my $level ( @{ $self->{_open_level_refs} } ) {
+        my $buy = ( $level->{side} eq 'buy' );
+        my $price = $level->{price};
+
+        # Detected -> Swept
         if ( $level->{state} eq 'DETECTED' ) {
-            $self->_check_sweep( $level, $candle, $i );
+            if ( $buy ? ( $ch > $price ) : ( $cl < $price ) ) {
+                $level->{state}          = 'SWEPT';
+                $level->{swept_at_index} = $i;
+            }
         }
+
+        # Swept -> (Reclaimed, pendiente) / Run
         if ( $level->{state} eq 'SWEPT' ) {
-            $self->_check_resolution( $level, $candle, $i );
+            my $n_since = $i - $level->{swept_at_index} + 1;
+            my $inside  = $buy ? ( $cc <= $price ) : ( $cc >= $price );
+            if ($inside) {
+                if ( $cw > 0 ) {
+                    # cerro de vuelta dentro: candidato a GRAB (rapido) o SWEEP
+                    # (lento). NO se resuelve aun: se espera continuation_window
+                    # velas para ver si el precio vuelve a romper y CONTINUA (RUN).
+                    $level->{state}         = 'RECLAIMED';
+                    $level->{reclaim_at}    = $i;
+                    $level->{pending_class} = ( $n_since <= $gw ) ? 'GRAB' : 'SWEEP';
+                } else {
+                    $self->_resolve( $level,
+                        ( $n_since <= $gw ? 'GRAB' : 'SWEEP' ), $i );
+                }
+            } elsif ( $n_since >= $an ) {
+                $self->_resolve( $level, 'RUN', $i );
+            }
         }
-        push @still_open, $level unless $level->{state} eq 'RESOLVED';
-    }
 
-    # FIX-6: cap del working set -- si superamos el limite, descartamos los
-    # niveles DETECTED mas antiguos (los mas recientes son los relevantes).
-    # Los niveles SWEPT se conservan siempre (estan en medio de resolucion).
-    if (@still_open > OPEN_LEVEL_CAP) {
-        my @swept    = grep { $_->{state} eq 'SWEPT' }    @still_open;
-        my @detected = grep { $_->{state} eq 'DETECTED' } @still_open;
-        # Conservar los OPEN_LEVEL_CAP/2 mas recientes de los DETECTED
-        my $keep = OPEN_LEVEL_CAP - scalar @swept;
-        $keep = 0 if $keep < 0;
-        if (@detected > $keep) {
-            @detected = @detected[-$keep..-1];  # los mas recientes
+        # Reclaimed -> Run (si vuelve a romper y continua) | Grab/Sweep (si se
+        # mantiene dentro tras continuation_window velas).
+        elsif ( $level->{state} eq 'RECLAIMED' ) {
+            my $outside_again = $buy ? ( $cc > $price ) : ( $cc < $price );
+            if ($outside_again) {
+                $self->_resolve( $level, 'RUN', $i );
+            } elsif ( ( $i - $level->{reclaim_at} ) >= $cw ) {
+                $self->_resolve( $level, $level->{pending_class}, $i );
+            }
         }
-        @still_open = (@swept, @detected);
-    }
 
+        next if $level->{state} eq 'RESOLVED';
+        push @still_open, $level;
+
+        # Agregados para el fast-skip de la proxima vela, segun estado final.
+        if ( $level->{state} eq 'DETECTED' ) {
+            if ( $level->{side} eq 'buy' ) {
+                $min_buy = $level->{price} if $level->{price} < $min_buy;
+            } else {
+                $max_sell = $level->{price} if $level->{price} > $max_sell;
+            }
+        } else {
+            $active++;   # SWEPT o RECLAIMED: siempre revisar la proxima vela
+        }
+    }
     $self->{_open_level_refs} = \@still_open;
+    $self->{_ws_min_buy}  = $min_buy;
+    $self->{_ws_max_sell} = $max_sell;
+    $self->{_ws_active}   = $active;
+    $self->{_ws_dirty}    = 0;
 }
 
 # -----------------------------------------------------------------------------
-# _check_sweep (privado) -- Estado 1 (Detected) -> Estado 2 (Swept)
-# BSL ('buy'): High > price.  SSL ('sell'): Low < price.
+# _recompute_ws_aggregates (privado)
+# Recalcula los agregados del working set (menor DETECTED buy, mayor DETECTED
+# sell, nº de niveles pendientes) que gobiernan el fast-skip de la maquina de
+# estados. Se invoca cuando el working set fue modificado fuera del escaneo
+# (alta de nivel / cap), marcado por _ws_dirty.
 # -----------------------------------------------------------------------------
-sub _check_sweep {
-    my ( $self, $level, $candle, $i ) = @_;
-
-    my $swept =
-        ( $level->{side} eq 'buy' )
-      ? ( $candle->{high} > $level->{price} )
-      : ( $candle->{low}  < $level->{price} );
-    return unless $swept;
-
-    $level->{state}          = 'SWEPT';
-    $level->{swept_at_index} = $i;
-}
-
-# -----------------------------------------------------------------------------
-# _check_resolution (privado) -- Estado 2 (Swept) -> Estado 5 (Resolved)
-# n_since incluye la propia vela del sweep (n_since=1 en esa misma vela).
-# -----------------------------------------------------------------------------
-sub _check_resolution {
-    my ( $self, $level, $candle, $i ) = @_;
-
-    my $n_since = $i - $level->{swept_at_index} + 1;
-
-    my $closed_inside =
-        ( $level->{side} eq 'buy' )
-      ? ( $candle->{close} <= $level->{price} )
-      : ( $candle->{close} >= $level->{price} );
-
-    if ($closed_inside) {
-        my $classification =
-            ( $n_since <= $self->{grab_window} ) ? 'GRAB' : 'SWEEP';
-        $self->_resolve( $level, $classification, $i );
-        return;
+sub _recompute_ws_aggregates {
+    my ($self) = @_;
+    my $min_buy  = 9e18;
+    my $max_sell = -9e18;
+    my $active   = 0;
+    for my $level ( @{ $self->{_open_level_refs} } ) {
+        my $st = $level->{state};
+        if ( $st eq 'DETECTED' ) {
+            if ( $level->{side} eq 'buy' ) {
+                $min_buy = $level->{price} if $level->{price} < $min_buy;
+            } else {
+                $max_sell = $level->{price} if $level->{price} > $max_sell;
+            }
+        } elsif ( $st ne 'RESOLVED' ) {
+            $active++;
+        }
     }
-
-    if ( $n_since >= $self->{acceptance_n} ) {
-        $self->_resolve( $level, 'RUN', $i );
-        return;
-    }
-
-    # Sigue abierto (Swept), esperando resolucion en velas siguientes.
+    $self->{_ws_min_buy}  = $min_buy;
+    $self->{_ws_max_sell} = $max_sell;
+    $self->{_ws_active}   = $active;
+    $self->{_ws_dirty}    = 0;
 }
 
 # -----------------------------------------------------------------------------

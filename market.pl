@@ -166,7 +166,20 @@ my $ind_manager = Market::IndicatorManager->new;
 my $atr_ind = Market::Indicators::ATR->new(14);
 my $liq_ind = Market::Indicators::Liquidity->new( atr => $atr_ind, k => 3 );
 my $smc_ind = Market::Indicators::SMC_Structures->new(
-    liquidity => $liq_ind, atr => $atr_ind, max_age => 50 );
+    liquidity => $liq_ind, atr => $atr_ind, max_age => 50,
+    # structure_atr_factor: umbral (en ATR) para que un pivote entre en la
+    # linea estructural mayor. Mas alto = linea mas limpia (menos picos
+    # internos). Rango util aprox 1.5 (mas detalle) .. 3.5 (solo tramos
+    # grandes). Ajustar aqui si el profesor quiere mas/menos estructura.
+    struct_atr_mult => 2.5,
+    # Zigzag EXTERNO (azul, estructura mayor) -- algoritmo de TradingView
+    # (ZZMTF © LonesomeTheBlue / ZigZag Volume Profile © ChartPrime). main_prd =
+    # "period"/"swingLength": la vela es pivote si su high/low es el mayor/menor
+    # de las ultimas main_prd VELAS. Mas alto = menos pivotes (menos ruido); mas
+    # bajo = mas detalle. Es conteo de velas: en temporalidades bajas (1m/5m/15m/
+    # 1h) hace falta un valor alto para que no sea ruidoso. 50 da una linea de
+    # estructura mayor limpia en esas temporalidades (bajarlo mete mucho ruido).
+    main_prd => 50 );
 
 $ind_manager->register('atr',       $atr_ind);
 $ind_manager->register('liquidity', $liq_ind);
@@ -226,18 +239,28 @@ my $engine = Market::ChartEngine->new(
 # =============================================================================
 my ( $replay_status_lbl, $btn_replay_play, $btn_replay_pause,
      $btn_replay_step_fwd, $btn_replay_step_back, $btn_replay_fast,
-     $btn_replay_exit );
+     $btn_replay_exit, $btn_replay_select );
+
+# Estado de la seleccion de vela de inicio (spec 19: REPLAY_SELECTING_START).
+# $refresh_replay_buttons se asigna mas abajo, tras crear los botones, y es la
+# UNICA fuente de verdad para habilitar/deshabilitar la barra de replay.
+my $replay_selecting = 0;
+my $refresh_replay_buttons;
 
 my $replay;
 $replay = Market::Replay->new(
     market     => $market,
     indicators => $ind_manager,
     schedule   => sub { $canvas_price->after(@_); },
+    cancel     => sub { my ($id) = @_; $canvas_price->afterCancel($id) if defined $id; },
     on_change  => sub {
         $engine->follow_replay_pointer;
 
         my $active  = $replay->is_active;
         my $playing = $replay->is_playing;
+
+        # Al salir del replay, quitar el marcador de inicio.
+        $engine->clear_replay_start_marker unless $active;
 
         if ($replay_status_lbl) {
             my $text = !$active
@@ -251,18 +274,7 @@ $replay = Market::Replay->new(
             $replay_status_lbl->configure(-text => $text);
         }
 
-        for my $pair (
-            [ $btn_replay_play,       $active ],
-            [ $btn_replay_pause,      $active && $playing ],
-            [ $btn_replay_step_fwd,   $active && !$playing ],
-            [ $btn_replay_step_back,  $active && !$playing ],
-            [ $btn_replay_fast,       $active ],
-            [ $btn_replay_exit,       $active ],
-        ) {
-            my ($btn, $enabled) = @$pair;
-            next unless $btn;
-            $btn->configure(-state => $enabled ? 'normal' : 'disabled');
-        }
+        $refresh_replay_buttons->() if $refresh_replay_buttons;
     },
 );
 
@@ -392,33 +404,61 @@ $tf_frame->Label(%bs,
 # =============================================================================
 # BARRA DE REPLAY (Etapa 3, Fase 2)
 # =============================================================================
-$replay_frame->Label(%bs, -text => 'Replay desde:')
+$replay_frame->Label(%bs, -text => 'Replay:')
     ->pack(-side => 'left', -padx => 6);
 
-# Prefill con el timestamp de la vela intermedia del CSV cargado (1m),
-# en el mismo formato ISO que ya usa el propio CSV -- editable por el
-# usuario, parseado con el mismo Time::Moment->from_string que usa la
-# carga del archivo.
-my $default_replay_str = $market->raw_get_candle( int($market->raw_size / 2) )->{time};
-my $replay_date_var = $default_replay_str;
-my $replay_entry = $replay_frame->Entry(
-    -textvariable => \$replay_date_var,
-    -width        => 26,
-    -font         => 'TkFixedFont 9',
-)->pack(-side => 'left', -padx => 2, -pady => 2);
-
-my $btn_replay_start = $replay_frame->Button(%bs,
-    -text    => 'Inicio Replay',
+# Seleccion de la vela de inicio POR CLIC (spec 18-20): el usuario pulsa este
+# boton, el grafico entra en modo seleccion (se bloquean los botones de replay)
+# y el proximo clic sobre una vela define el punto de arranque. Vuelve a pulsar
+# (o Escape) para cancelar. Sin TextField ni fechas.
+$btn_replay_select = $replay_frame->Button(%bs,
+    -text    => 'Seleccionar Inicio',
     -command => sub {
-        my $tm;
-        eval { $tm = Time::Moment->from_string($replay_date_var) };
-        if ($@ || !$tm) {
+        # Segundo clic en el boton = cancelar la seleccion en curso.
+        if ($replay_selecting) {
+            $engine->cancel_candle_pick;
+            $replay_selecting = 0;
             $replay_status_lbl->configure(
-                -text => "Fecha invalida: '$replay_date_var' (formato esperado: 2026-04-15T12:00:00-05:00)"
+                -text => $replay->is_active
+                    ? 'REPLAY (seleccion cancelada)'
+                    : 'EN VIVO (replay inactivo)'
             );
+            $refresh_replay_buttons->();
             return;
         }
-        $replay->start($tm->epoch);
+
+        # Entrar en modo seleccion: pausar cualquier reproduccion en curso,
+        # bloquear botones y esperar el clic.
+        $replay->pause if $replay->is_playing;
+        $replay_selecting = 1;
+        $replay_status_lbl->configure(
+            -text => 'Seleccione una vela para iniciar el replay'
+        );
+        $refresh_replay_buttons->();
+
+        $engine->begin_candle_pick(sub {
+            my ($idx, $c) = @_;
+            $replay_selecting = 0;
+            if ($c) {
+                # Marca visual en la vela elegida (fecha/hora) para confirmar
+                # desde donde arranca el replay.
+                my $when = Time::Moment->from_epoch($c->{ts})
+                    ->with_offset_same_instant(-300)
+                    ->strftime('%Y-%m-%d %H:%M');
+                $engine->set_replay_start_marker($idx, $when);
+                # start() dispara on_change, que refresca la barra de replay.
+                $replay->start($c->{ts});
+            }
+            else {
+                # Cancelado con Escape sin elegir vela.
+                $replay_status_lbl->configure(
+                    -text => $replay->is_active
+                        ? 'REPLAY (seleccion cancelada)'
+                        : 'EN VIVO (replay inactivo)'
+                );
+                $refresh_replay_buttons->();
+            }
+        });
     },
 )->pack(-side => 'left', -padx => 4, -pady => 2);
 
@@ -470,6 +510,40 @@ $replay_status_lbl = $replay_frame->Label(%bs,
     -foreground => '#363a45',
     -font       => 'TkDefaultFont 9 bold',
 )->pack(-side => 'left', -padx => 10);
+
+# -----------------------------------------------------------------------------
+# refresh_replay_buttons: sincroniza la barra de replay con el estado (spec 19).
+#   - Durante la seleccion de vela ($replay_selecting) TODOS los botones de
+#     accion quedan bloqueados; el boton de seleccion pasa a "Cancelar".
+#   - Fuera de seleccion, se habilitan segun replay activo / en reproduccion.
+# Se llama desde on_change (arranque/paso/play/pausa/salida) y desde la propia
+# logica de seleccion.
+# -----------------------------------------------------------------------------
+$refresh_replay_buttons = sub {
+    my $active  = $replay->is_active;
+    my $playing = $replay->is_playing;
+    my $sel     = $replay_selecting;
+
+    for my $pair (
+        [ $btn_replay_play,      !$sel && $active ],
+        [ $btn_replay_pause,     !$sel && $active && $playing ],
+        [ $btn_replay_step_fwd,  !$sel && $active && !$playing ],
+        [ $btn_replay_step_back, !$sel && $active && !$playing ],
+        [ $btn_replay_fast,      !$sel && $active ],
+        [ $btn_replay_exit,      !$sel && $active ],
+    ) {
+        my ($btn, $enabled) = @$pair;
+        next unless $btn;
+        $btn->configure(-state => $enabled ? 'normal' : 'disabled');
+    }
+
+    if ($btn_replay_select) {
+        $btn_replay_select->configure(
+            -text  => $sel ? 'Cancelar seleccion' : 'Seleccionar Inicio',
+            -state => 'normal',
+        );
+    }
+};
 
 # =============================================================================
 # DRAG DEL SEPARADOR ATR

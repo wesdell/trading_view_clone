@@ -86,11 +86,11 @@ sub toggle {
 #     cuando el usuario desactiva un overlay.
 # -----------------------------------------------------------------------------
 sub render_all {
-    my ($self, $canvas, $scale) = @_;
+    my ($self, $canvas, $scale, $placer) = @_;
     for my $name (@{ $self->{_order} }) {
         my $overlay = $self->{overlays}{$name};
         if ($self->{_visible}{$name}) {
-            $overlay->render($canvas, $scale);
+            $overlay->render($canvas, $scale, $placer);
         } else {
             $canvas->delete($overlay->tag);
         }
