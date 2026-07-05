@@ -98,8 +98,9 @@ sub _render_struct {
     my $swings = $src->get_struct_swings or return;
     return unless @$swings;
 
-    my $off = $scale->{offset};
-    my $vb  = $scale->{visible_bars};
+    my $off    = $scale->{offset};
+    my $vb     = $scale->{visible_bars};
+    my $plot_w = $scale->_plot_w;   # borde derecho del area de grafico (regleta a la derecha)
 
     # --- Linea zigzag ESTRUCTURA MAYOR: se dibuja con la version compactada
     # (get_main_struct), que une directamente el origen con el extremo principal
@@ -128,6 +129,10 @@ sub _render_struct {
                                  $scale->value_to_y_raw($prev->{price}); $prev = undef; }
         push @pts, $xy->();
     }
+    # Recortar la polilinea al area de grafico [0, plot_w]: el pivote bracketing
+    # de la derecha cae DENTRO de la regleta de precios; sin recorte la linea la
+    # taparia. Se interpola la Y en el borde para no distorsionar la pendiente.
+    @pts = _clip_polyline_x(\@pts, 0, $plot_w);
     if (@pts >= 4) {
         $canvas->createLine(@pts,
             -fill  => C_ZIGZAG,
@@ -146,6 +151,7 @@ sub _render_struct {
         next unless $scale->value_in_range($sw->{price});
 
         my $x     = $scale->index_to_center_x($sw->{index});
+        next if $x < 0 || $x > $plot_w;   # fuera del area de grafico (no tapar la regleta)
         my $y     = $scale->value_to_y($sw->{price});
         my $up    = ($sw->{kind} eq 'H');
         my $color = ($sw->{label} eq 'HH' || $sw->{label} eq 'HL') ? C_HH_HL : C_LH_LL;
@@ -440,6 +446,49 @@ sub _box_hits {
         return 1;
     }
     return 0;
+}
+
+# -----------------------------------------------------------------------------
+# _clip_polyline_x: recorta una polilinea (@pts = x0,y0,x1,y1,...) al rango
+# horizontal [xmin, xmax], interpolando la Y en los cruces de borde. Los
+# pivotes vienen en X estrictamente creciente (orden por indice), asi que solo
+# hay UN cruce de entrada (izq) y UNO de salida (der). Evita que la linea se
+# meta en la regleta de precios (a la derecha de xmax = _plot_w).
+# -----------------------------------------------------------------------------
+sub _clip_polyline_x {
+    my ($pts, $xmin, $xmax) = @_;
+    my $n = int(@$pts / 2);
+    return () if $n < 2;
+
+    my @out;
+    for (my $i = 0; $i < $n; $i++) {
+        my ($x, $y) = ($pts->[2*$i], $pts->[2*$i+1]);
+
+        if ($x < $xmin) {
+            # cruce de entrada por la izquierda: interpolar en xmin con el siguiente
+            if ($i + 1 < $n) {
+                my ($nx, $ny) = ($pts->[2*$i+2], $pts->[2*$i+3]);
+                if ($nx > $x && $nx >= $xmin) {
+                    my $t = ($xmin - $x) / ($nx - $x);
+                    push @out, $xmin, $y + $t * ($ny - $y);
+                }
+            }
+            next;
+        }
+        if ($x > $xmax) {
+            # cruce de salida por la derecha: interpolar en xmax con el anterior
+            if ($i > 0) {
+                my ($px, $py) = ($pts->[2*$i-2], $pts->[2*$i-1]);
+                if ($px < $x && $px <= $xmax) {
+                    my $t = ($xmax - $px) / ($x - $px);
+                    push @out, $xmax, $py + $t * ($y - $py);
+                }
+            }
+            last;   # X monotona creciente: ya no hay mas puntos dentro del rango
+        }
+        push @out, $x, $y;
+    }
+    return @out;
 }
 
 # Mezcla hex con fondo blanco segun opacidad
