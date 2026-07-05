@@ -37,8 +37,9 @@ use constant {
     C_EQ     => '#7e57c2',   # violeta (EQH/EQL, configurable)
     C_GRAB   => '#ff9800',   # naranja (Liquidity Grab)
     C_RUN    => '#2962ff',   # azul    (Liquidity Run)
-    MAX_LINES  => 6,         # niveles BSL/SSL resting dibujados (mas recientes)
-    MAX_EVENTS => 50,        # eventos recientes considerados por render
+    MAX_LINES   => 6,        # niveles BSL/SSL resting dibujados (mas recientes)
+    MAX_EVENTS  => 50,       # eventos recientes considerados por render
+    CLUSTER_GAP => 3,        # FIX-LQ2b: velas de tolerancia para agrupar eventos
 };
 
 sub new {
@@ -66,34 +67,17 @@ sub set_flag {
 }
 
 sub render {
-    my ( $self, $canvas, $scale, $placer ) = @_;
+    my ( $self, $canvas, $scale ) = @_;
     $canvas->delete(TAG);
     my $src = $self->{source};
     return unless $src;
 
-    # $placer (opcional): las etiquetas se encolan en el LabelPlacer compartido
-    # (anti-solape global contra velas y demas etiquetas). Sin placer, cae al
-    # chip inmediato clasico.
+    my @placed;   # cajas [x1,y1,x2,y2] de etiquetas ya colocadas (anti-solape)
     $self->_render_swings( $canvas, $scale, $src )            if $self->{show_swing};
-    $self->_render_levels( $canvas, $scale, $src, $placer );
-    $self->_render_equals( $canvas, $scale, $src, $placer )
+    $self->_render_levels( $canvas, $scale, $src, \@placed );
+    $self->_render_equals( $canvas, $scale, $src, \@placed )
         if $self->{show_eqh} || $self->{show_eql};
-    $self->_render_events( $canvas, $scale, $src, $placer );
-}
-
-# _label: encola en el placer o cae al chip inmediato (compatibilidad).
-sub _label {
-    my ($self, $placer, $canvas, $x, $y, $text, %o) = @_;
-    if ($placer) {
-        $placer->add(
-            x => $x, y => $y, text => $text,
-            color => $o{color}, style => $o{style}, side => $o{side},
-            priority => $o{priority}, hideable => $o{hideable}, font => $o{font},
-        );
-    } else {
-        $self->_chip($canvas, $x, $y, $text,
-            -color => $o{color}, -style => $o{style}, -place => $o{side});
-    }
+    $self->_render_events( $canvas, $scale, $src, \@placed );
 }
 
 # -----------------------------------------------------------------------------
@@ -101,7 +85,7 @@ sub _label {
 # extiende a la derecha; chip outline "BSL"/"SSL" junto a la regleta de precio.
 # -----------------------------------------------------------------------------
 sub _render_levels {
-    my ( $self, $canvas, $scale, $src, $placer ) = @_;
+    my ( $self, $canvas, $scale, $src, $placed ) = @_;
     my $levels = $src->get_levels or return;
 
     my $off    = $scale->{offset};
@@ -134,9 +118,9 @@ sub _render_levels {
                 $x1, $y, $plot_w, $y,
                 -fill => $color, -dash => [ 2, 3 ], -width => 1, -tags => [TAG] );
 
-            $self->_label( $placer, $canvas, $plot_w - 20, $y, $text,
-                color => $color, style => 'outline', side => 'center',
-                priority => 5, hideable => 1 );
+            $self->_chip( $canvas, $plot_w - 20, $y, $text,
+                -color => $color, -style => 'outline', -place => 'center',
+                -placed => $placed );
         }
     }
 }
@@ -173,7 +157,7 @@ sub _render_swings {
 # EQH / EQL: linea punteada que conecta ambos pivotes iguales + chip outline.
 # -----------------------------------------------------------------------------
 sub _render_equals {
-    my ( $self, $canvas, $scale, $src, $placer ) = @_;
+    my ( $self, $canvas, $scale, $src, $placed ) = @_;
     my $eqs = $src->get_equals or return;
 
     my $off = $scale->{offset};
@@ -196,19 +180,31 @@ sub _render_equals {
         $canvas->createLine( $x1, $y1, $x2, $y2,
             -fill => C_EQ, -width => 1, -dash => [ 4, 2 ], -tags => [TAG] );
 
-        $self->_label( $placer, $canvas, ( $x1 + $x2 ) / 2, ( $y1 + $y2 ) / 2, $e->{kind},
-            color => C_EQ, style => 'outline',
-            side  => ( $is_high ? 'above' : 'below' ),
-            priority => 6, hideable => 1 );
+        $self->_chip( $canvas, ( $x1 + $x2 ) / 2, ( $y1 + $y2 ) / 2, $e->{kind},
+            -color => C_EQ, -style => 'outline',
+            -place => ( $is_high ? 'above' : 'below' ), -placed => $placed );
     }
 }
 
 # -----------------------------------------------------------------------------
 # Eventos Sweep / Grab / Run: marcador en la vela de resolucion + chip solido
 # (anti-solape, prioriza los mas recientes).
+#
+# FIX-LQ2 (v2 -- clustering por cercania, no por indice exacto):
+# Una sola racha volatil puede resolver varios niveles HISTORICAMENTE
+# DISTINTOS (no duplicados -- verificado con datos reales del
+# 2026_06_29.csv) en la misma vela O en un puñado de velas consecutivas.
+# Exigir el MISMO indice exacto es fragil: pequenos desfases en como se
+# construyen las velas (orden de concatenacion de CSVs, deduplicado por
+# timestamp, etc.) pueden mover la resolucion de un nivel una vela para
+# adelante o atras sin que eso cambie el hecho de que visualmente caen en
+# el mismo punto del grafico. Por eso se agrupan por CERCANIA: mismo
+# type+dir Y separados por <= CLUSTER_GAP velas entre resoluciones
+# consecutivas -> un solo marcador con contador ("SSL GRAB x4"), anclado a
+# la vela MAS RECIENTE del grupo, en vez de N chips sueltos.
 # -----------------------------------------------------------------------------
 sub _render_events {
-    my ( $self, $canvas, $scale, $src, $placer ) = @_;
+    my ( $self, $canvas, $scale, $src, $placed ) = @_;
     my $events = $src->get_events or return;
 
     my $off = $scale->{offset};
@@ -217,48 +213,58 @@ sub _render_events {
     my $start = $#$events - MAX_EVENTS;
     $start = 0 if $start < 0;
 
-    my %by_it;    # "index:type" ya dibujado -> UNA etiqueta por vela y tipo
-    my @drawn;    # [x, y, type] de eventos ya dibujados (anti-repeticion)
-    for ( my $k = $#$events ; $k >= $start ; $k-- ) {
+    # --- Paso 1: filtrar por toggles/ventana visible ---
+    my @visible;
+    for ( my $k = $start; $k <= $#$events; $k++ ) {
         my $ev = $events->[$k];
         my $t  = $ev->{type};
         next if $t eq 'SWEEP' && !$self->{show_sweeps};
         next if $t eq 'GRAB'  && !$self->{show_grabs};
         next if $t eq 'RUN'   && !$self->{show_runs};
-
         next if $ev->{index} < $off || $ev->{index} > $off + $vb;
-        next unless $scale->value_in_range( $ev->{price} );
+        push @visible, $ev;
+    }
+    # get_events() ya viene en orden cronologico de resolucion, pero no lo
+    # asumimos: el clustering por cercania depende de recorrerlos ordenados.
+    @visible = sort { $a->{index} <=> $b->{index} } @visible;
 
-        # Anti-repeticion 1 (LA MISMA VELA): varios niveles de liquidez pueden
-        # resolverse (sweep/grab/run) en la MISMA vela a precios distintos; antes
-        # se dibujaba una etiqueta por cada nivel -> se amontonaban en la misma
-        # vela. Se permite como maximo UNA etiqueta por (vela, tipo); como se
-        # recorre de mas reciente a mas antiguo, se conserva la mas nueva.
-        my $itkey = $ev->{index} . ':' . $t;
-        next if $by_it{$itkey}++;
-
-        my $x = $scale->index_to_center_x( $ev->{index} );
-        my $y = $scale->value_to_y( $ev->{price} );
-
-        # Anti-repeticion 2: si ya se dibujo un evento del MISMO tipo muy cerca
-        # (velas contiguas), se omite. Evita la maraña de etiquetas Sweep/Grab/
-        # Run repetidas sobre la misma zona de liquidez (spec 15: tratar señales
-        # dentro de la misma tolerancia como una sola).
-        my $dup = 0;
-        for my $d (@drawn) {
-            next unless $d->[2] eq $t;
-            if ( abs( $d->[0] - $x ) < 48 && abs( $d->[1] - $y ) < 30 ) {
-                $dup = 1; last;
-            }
+    # --- Paso 2: clustering por cercania (no por indice exacto) ---
+    my @groups;
+    for my $ev (@visible) {
+        my $g = $groups[-1];
+        if (   $g
+            && $g->{type} eq $ev->{type}
+            && $g->{dir}  eq $ev->{dir}
+            && ( $ev->{index} - $g->{index} ) <= CLUSTER_GAP )
+        {
+            push @{ $g->{prices} }, $ev->{price};
+            $g->{index} = $ev->{index} if $ev->{index} > $g->{index};   # ancla al mas reciente
         }
-        next if $dup;
-        push @drawn, [ $x, $y, $t ];
-        my $color =
-            ( $t eq 'GRAB' ) ? C_GRAB
-          : ( $t eq 'RUN' )  ? C_RUN
-          : ( $ev->{dir} eq 'up' ) ? C_BSL : C_SSL;
+        else {
+            push @groups, {
+                type => $ev->{type}, dir => $ev->{dir}, label => $ev->{label},
+                index => $ev->{index}, prices => [ $ev->{price} ],
+            };
+        }
+    }
 
-        my $up = ( $ev->{dir} eq 'up' );
+    # --- Paso 3: dibujar del mas reciente al mas antiguo (igual que antes) ---
+    for my $g ( reverse @groups ) {
+        my $up = ( $g->{dir} eq 'up' );
+
+        # Precio representativo: el extremo del grupo (el barrido mas
+        # profundo), no un promedio -- asi el marcador queda anclado al
+        # nivel que de verdad importa en vez de flotar entre varios.
+        my $price = $up ? _min( @{ $g->{prices} } ) : _max( @{ $g->{prices} } );
+        next unless $scale->value_in_range($price);
+
+        my $x = $scale->index_to_center_x( $g->{index} );
+        my $y = $scale->value_to_y($price);
+        my $color =
+            ( $g->{type} eq 'GRAB' ) ? C_GRAB
+          : ( $g->{type} eq 'RUN' )  ? C_RUN
+          : ( $up ? C_BSL : C_SSL );
+
         my $dy = $up ? -10 : 10;
 
         $canvas->createLine( $x, $y, $x, $y + $dy,
@@ -266,14 +272,17 @@ sub _render_events {
         $canvas->createOval( $x - 3, $y - 3, $x + 3, $y + 3,
             -fill => $color, -outline => $color, -tags => [TAG] );
 
-        # LQ RUN mas prioritario que Sweep/Grab (spec 8).
-        my $prio = ( $t eq 'RUN' ) ? 3 : 4;
-        $self->_label( $placer, $canvas, $x, $y + $dy, $ev->{label},
-            color => $color, style => 'solid',
-            side  => ( $up ? 'above' : 'below' ),
-            priority => $prio, hideable => 1 );
+        my $n     = scalar @{ $g->{prices} };
+        my $label = $n > 1 ? "$g->{label} x$n" : $g->{label};
+
+        $self->_chip( $canvas, $x, $y + $dy, $label,
+            -color => $color, -style => 'solid',
+            -place => ( $up ? 'above' : 'below' ), -placed => $placed );
     }
 }
+
+sub _min { my $m = shift; for (@_) { $m = $_ if $_ < $m } return $m; }
+sub _max { my $m = shift; for (@_) { $m = $_ if $_ > $m } return $m; }
 
 # -----------------------------------------------------------------------------
 # _chip: etiqueta tipo TradingView (replica del proyecto de referencia).
