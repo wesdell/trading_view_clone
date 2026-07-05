@@ -33,7 +33,12 @@ use constant {
     C_CHOCH_DN  => '#ff6d00',   # CHoCH bajista (naranja)
     C_HH_HL     => '#26a69a',   # HH/HL labels  (alcista = verde)
     C_LH_LL     => '#ef5350',   # LH/LL labels  (bajista = rojo)
-    C_ZIGZAG    => '#546e7a',   # linea zigzag  (gris azulado)
+    C_ZIGZAG    => '#546e7a',   # linea zigzag  (gris azulado, legacy)
+    # PDF "direccion interna/externa": zigzag INTERNO (fino) verde=subida /
+    # rojo=bajada; zigzag EXTERNO (estructura mayor compactada) en azul.
+    C_ZZ_INT_UP => '#26a69a',   # zigzag interno: pierna alcista (verde)
+    C_ZZ_INT_DN => '#ef5350',   # zigzag interno: pierna bajista (rojo)
+    C_ZZ_EXT    => '#2962ff',   # zigzag externo / estructura mayor (azul)
     C_OB_BULL   => '#81c784',   # OB alcista (demand)
     C_OB_BEAR   => '#e57373',   # OB bajista (supply)
 };
@@ -102,41 +107,39 @@ sub _render_struct {
     my $vb     = $scale->{visible_bars};
     my $plot_w = $scale->_plot_w;   # borde derecho del area de grafico (regleta a la derecha)
 
-    # --- Linea zigzag ESTRUCTURA MAYOR: se dibuja con la version compactada
-    # (get_main_struct), que une directamente el origen con el extremo principal
-    # de cada tramo fuerte (LL -> HH directo, sin zigzaguear por los pivotes
-    # internos). Las etiquetas y puntos de abajo siguen usando los pivotes
-    # crudos (get_struct_swings), asi que el detalle HH/HL/LH/LL no se pierde.
-    my $main = $src->can('get_main_struct') ? $src->get_main_struct : $swings;
-    # Se incluye el pivote inmediatamente ANTERIOR y POSTERIOR a la ventana para
-    # que las piernas largas (compactadas) que la cruzan se dibujen completas.
-    # value_to_y_raw (recortado a +-10000) evita que un pivote fuera de rango
-    # vertical rompa la polilinea; Tk recorta el resto.
+    # --- DOS zigzags de direccion (spec PDF "direccion interna/externa") ---
+    # Se incluye el pivote ANTERIOR y POSTERIOR a la ventana para que las
+    # piernas que la cruzan se dibujen completas. Todo se recorta a [0, plot_w]
+    # para no invadir la regleta de precios.
     my ($lo, $hi) = ($off - 1, $off + $vb + 1);
-    my @pts;
-    my $prev;
-    for my $sw (@$main) {
-        my $xy = sub { ( $scale->index_to_center_x($sw->{index}),
-                         $scale->value_to_y_raw($sw->{price}) ) };
-        if ($sw->{index} < $lo) { $prev = $sw; next; }
-        if ($sw->{index} > $hi) {
-            if ($prev) { push @pts, $scale->index_to_center_x($prev->{index}),
-                                     $scale->value_to_y_raw($prev->{price}); $prev = undef; }
-            push @pts, $xy->();
-            last;
-        }
-        if ($prev) { push @pts, $scale->index_to_center_x($prev->{index}),
-                                 $scale->value_to_y_raw($prev->{price}); $prev = undef; }
-        push @pts, $xy->();
+
+    # 1) Zigzag INTERNO (direccion interna): usa TODOS los pivotes estructurales
+    #    finos (get_struct_swings) y colorea cada segmento segun su direccion:
+    #    verde = pierna alcista (hacia un High), rojo = pierna bajista.
+    my @iv = _visible_pivots($swings, $lo, $hi);
+    for my $s (1 .. $#iv) {
+        my $a = $iv[$s-1]; my $b = $iv[$s];
+        my $up    = ($b->{kind} eq 'H');   # llega a un High -> pierna alcista
+        my $color = $up ? C_ZZ_INT_UP : C_ZZ_INT_DN;
+        $self->_seg_clipped($canvas, $scale, $a, $b, 0, $plot_w, $color, 1);
     }
-    # Recortar la polilinea al area de grafico [0, plot_w]: el pivote bracketing
-    # de la derecha cae DENTRO de la regleta de precios; sin recorte la linea la
-    # taparia. Se interpola la Y en el borde para no distorsionar la pendiente.
+
+    # 2) Zigzag EXTERNO (direccion externa = ESTRUCTURA MAYOR compactada):
+    #    une directamente origen->extremo de cada tramo fuerte (LL->HH directo)
+    #    y se pinta en AZUL, mas grueso, por encima del interno. Las etiquetas
+    #    HH/HL/LH/LL de abajo siguen sobre los pivotes crudos (no se pierde detalle).
+    my $main = $src->can('get_main_struct') ? $src->get_main_struct : $swings;
+    my @ev = _visible_pivots($main, $lo, $hi);
+    my @pts;
+    for my $p (@ev) {
+        push @pts, $scale->index_to_center_x($p->{index}),
+                   $scale->value_to_y_raw($p->{price});
+    }
     @pts = _clip_polyline_x(\@pts, 0, $plot_w);
     if (@pts >= 4) {
         $canvas->createLine(@pts,
-            -fill  => C_ZIGZAG,
-            -width => 1,
+            -fill  => C_ZZ_EXT,
+            -width => 2,
             -tags  => [TAG]);
     }
 
@@ -446,6 +449,41 @@ sub _box_hits {
         return 1;
     }
     return 0;
+}
+
+# -----------------------------------------------------------------------------
+# _visible_pivots: pivotes de $list dentro de [lo,hi] MAS un pivote bracketing
+# a cada lado (el ultimo antes de lo y el primero despues de hi), para que las
+# piernas que cruzan la ventana se dibujen completas.
+# -----------------------------------------------------------------------------
+sub _visible_pivots {
+    my ($list, $lo, $hi) = @_;
+    my @out;
+    my $prev;
+    for my $sw (@$list) {
+        if ($sw->{index} < $lo) { $prev = $sw; next; }
+        if (defined $prev) { push @out, $prev; $prev = undef; }
+        push @out, $sw;
+        last if $sw->{index} > $hi;   # ya incluido el primero > hi
+    }
+    return @out;
+}
+
+# -----------------------------------------------------------------------------
+# _seg_clipped: dibuja el segmento pivote $a -> $b (X creciente) recortado a
+# [xmin,xmax], interpolando la Y en los bordes (no invade la regleta).
+# -----------------------------------------------------------------------------
+sub _seg_clipped {
+    my ($self, $canvas, $scale, $a, $b, $xmin, $xmax, $color, $width) = @_;
+    my $x1 = $scale->index_to_center_x($a->{index});
+    my $y1 = $scale->value_to_y_raw($a->{price});
+    my $x2 = $scale->index_to_center_x($b->{index});
+    my $y2 = $scale->value_to_y_raw($b->{price});
+    return if $x2 < $xmin || $x1 > $xmax;   # totalmente fuera del area
+    if ($x2 > $xmax && $x2 != $x1) { my $t = ($xmax-$x1)/($x2-$x1); $x2 = $xmax; $y2 = $y1 + $t*($y2-$y1); }
+    if ($x1 < $xmin && $x1 != $x2) { my $t = ($xmin-$x2)/($x1-$x2); $x1 = $xmin; $y1 = $y2 + $t*($y1-$y2); }
+    $canvas->createLine($x1, $y1, $x2, $y2,
+        -fill => $color, -width => ($width // 1), -tags => [TAG]);
 }
 
 # -----------------------------------------------------------------------------
