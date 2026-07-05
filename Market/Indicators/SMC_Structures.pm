@@ -30,6 +30,16 @@ sub new {
         # detalle. Sustituye al antiguo main_retrace (colapso greedy).
         main_atr_mult      => $args{main_atr_mult}     // 5.0,
 
+        # Confirmacion por VOLUMEN de los pivotes estructurales (spec docente:
+        # "considerar volatilidad Y volumen"). Un pivote nuevo se acepta si el
+        # volumen de su vela supera volume_ma(volume_ma_period) * volume_factor.
+        # TOLERANTE: si el dataset no tiene volumen (promedio 0) no filtra. Solo
+        # afecta las etiquetas HH/HL/LH/LL (no sweep/grab/EQ). use_volume=0 lo
+        # desactiva.
+        use_volume         => defined $args{use_volume} ? $args{use_volume} : 1,
+        volume_ma_period   => $args{volume_ma_period}  // 20,
+        volume_factor      => $args{volume_factor}     // 1.0,
+
         _c            => [],
         _fvgs         => [],
         _active_fvgs  => [],
@@ -256,8 +266,30 @@ sub _add_structural_pivot {
     return if ($min_leg > 0 && $move < $min_leg);
     return if ($bars < $self->{struct_min_bars});
 
+    # 2c) Confirmacion por VOLUMEN: el pivote gana validez si su vela tiene
+    # volumen >= promedio_reciente * volume_factor (tolerante si no hay volumen).
+    return if ($self->{use_volume} && !$self->_volume_ok($sw->{index}));
+
     push @$list, _mk_pivot($sw);
     $self->_after_struct_change($sw->{kind});
+}
+
+# -----------------------------------------------------------------------------
+# _volume_ok: 1 si la vela $idx tiene volumen >= volume_ma * volume_factor.
+# Tolerante: si no hay datos de volumen (promedio 0) devuelve 1 (usa solo ATR).
+# -----------------------------------------------------------------------------
+sub _volume_ok {
+    my ($self, $idx) = @_;
+    my $c = $self->{_c};
+    return 1 if $idx < 0 || $idx > $#$c;
+    my $lo = $idx - $self->{volume_ma_period} + 1;
+    $lo = 0 if $lo < 0;
+    my ($sum, $n) = (0, 0);
+    for my $j ($lo .. $idx) { $sum += ($c->[$j]{volume} // 0); $n++; }
+    return 1 if $n == 0;
+    my $ma = $sum / $n;
+    return 1 if $ma <= 0;   # sin volumen -> no filtra
+    return (($c->[$idx]{volume} // 0) >= $ma * $self->{volume_factor}) ? 1 : 0;
 }
 
 # _mk_pivot: crea el pivote; la etiqueta final la fija _relabel_last.

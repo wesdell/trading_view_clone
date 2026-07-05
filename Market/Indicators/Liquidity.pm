@@ -87,6 +87,12 @@ sub new {
         track_volume    => defined $args{track_volume} ? $args{track_volume} : 1,
         grab_window  => $args{grab_window}  // 2,
         acceptance_n => $args{acceptance_n} // 5,
+        # Ventana de CONTINUACION: tras un reclamo (cierre de vuelta dentro que
+        # seria GRAB/SWEEP) se esperan estas velas; si el precio vuelve a romper
+        # y continua en la direccion del barrido, se reclasifica como RUN
+        # (corrige "grabs que en realidad eran LQ RUN"). 0 = resolver de
+        # inmediato (comportamiento anterior).
+        continuation_window => $args{continuation_window} // 3,
         atr_factor   => $args{atr_factor}   // 0.30,
         atr          => $args{atr},   # referencia DIRECTA al objeto ATR
 
@@ -450,6 +456,7 @@ sub _update_state_machine {
     my $cc = $candle->{close};
     my $gw = $self->{grab_window};
     my $an = $self->{acceptance_n};
+    my $cw = $self->{continuation_window};
 
     my @still_open;
     for my $level ( @{ $self->{_open_level_refs} } ) {
@@ -464,15 +471,35 @@ sub _update_state_machine {
             }
         }
 
-        # Swept -> Grab / Sweep / Run
+        # Swept -> (Reclaimed, pendiente) / Run
         if ( $level->{state} eq 'SWEPT' ) {
             my $n_since = $i - $level->{swept_at_index} + 1;
             my $inside  = $buy ? ( $cc <= $price ) : ( $cc >= $price );
             if ($inside) {
-                $self->_resolve( $level,
-                    ( $n_since <= $gw ? 'GRAB' : 'SWEEP' ), $i );
+                if ( $cw > 0 ) {
+                    # cerro de vuelta dentro: candidato a GRAB (rapido) o SWEEP
+                    # (lento). NO se resuelve aun: se espera continuation_window
+                    # velas para ver si el precio vuelve a romper y CONTINUA (RUN).
+                    $level->{state}         = 'RECLAIMED';
+                    $level->{reclaim_at}    = $i;
+                    $level->{pending_class} = ( $n_since <= $gw ) ? 'GRAB' : 'SWEEP';
+                } else {
+                    $self->_resolve( $level,
+                        ( $n_since <= $gw ? 'GRAB' : 'SWEEP' ), $i );
+                }
             } elsif ( $n_since >= $an ) {
                 $self->_resolve( $level, 'RUN', $i );
+            }
+        }
+
+        # Reclaimed -> Run (si vuelve a romper y continua) | Grab/Sweep (si se
+        # mantiene dentro tras continuation_window velas).
+        elsif ( $level->{state} eq 'RECLAIMED' ) {
+            my $outside_again = $buy ? ( $cc > $price ) : ( $cc < $price );
+            if ($outside_again) {
+                $self->_resolve( $level, 'RUN', $i );
+            } elsif ( ( $i - $level->{reclaim_at} ) >= $cw ) {
+                $self->_resolve( $level, $level->{pending_class}, $i );
             }
         }
 
