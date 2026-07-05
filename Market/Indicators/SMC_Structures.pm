@@ -36,6 +36,19 @@ sub new {
         # higher-low posterior (estructura de mercado, no pico geometrico).
         main_dtop_atr      => $args{main_dtop_atr}     // 1.0,
 
+        # --- ZigZag EXTERNO estilo TradingView (linea azul de estructura mayor)
+        # Portado de los indicadores de TradingView "ZZMTF" (© LonesomeTheBlue) y
+        # "ZigZag Volume Profile" (© ChartPrime): el pivote es CAUSAL -- la vela
+        # actual es swing-high si su high es el MAYOR de las ultimas main_prd
+        # velas (ta.highest / ta.lowest, highestbars==0), y swing-low si su low es
+        # el MENOR. La direccion (dir) cambia al aparecer un nuevo extremo del
+        # lado opuesto; cada cambio de direccion fija un pivote y la pierna en
+        # curso se extiende hasta su extremo. Sustituye al zigzag por umbral-ATR
+        # (que saltaba pivotes cuando el ATR daba un pico). main_prd = "period" de
+        # ZZMTF / "swingLength" del Volume Profile: mas alto => estructura mas
+        # mayor (menos pivotes). Sin fuga de futuro (solo mira hacia atras).
+        main_prd           => $args{main_prd}         // 30,
+
         # Confirmacion por VOLUMEN de los pivotes estructurales (spec docente:
         # "considerar volatilidad Y volumen"). Un pivote nuevo se acepta si el
         # volumen de su vela supera volume_ma(volume_ma_period) * volume_factor.
@@ -56,6 +69,10 @@ sub new {
         _struct_swings  => [],
         _seen_sh_idx    => -1,
         _seen_sl_idx    => -1,
+
+        # Estado del ZigZag externo estilo TradingView (ver main_prd).
+        _zz_dir     => 0,    # 0 = sin definir, 1 = alcista, -1 = bajista
+        _zz_pivots  => [],   # pivotes alternados {kind,index,price,ts}
         _last_hh => undef, _last_hl => undef,
         _last_lh => undef, _last_ll => undef,
 
@@ -91,57 +108,10 @@ sub get_order_blocks  { return $_[0]->{_order_blocks}; }
 # -----------------------------------------------------------------------------
 sub get_main_struct {
     my ($self) = @_;
-    my $raw = $self->{_struct_swings};
-    return [] unless @$raw;
-
-    # ZigZag por UMBRAL DE REVERSION (no colapso greedy). Reglas por pivote:
-    #  - Mismo lado que el ultimo pivote confirmado -> EXTIENDE el extremo
-    #    (se queda con el high mas alto / low mas bajo de la pierna en curso).
-    #  - Lado OPUESTO -> confirma una NUEVA pierna SOLO si el movimiento contra
-    #    el ultimo pivote supera main_atr_mult*ATR; si no, es una reversion
-    #    menor y se ignora (la pierna sigue extendiendose).
-    # Asi la linea externa une los swings MAYORES en alternancia sin aplastar
-    # una tendencia sana (el criterio greedy anterior comparaba contra la pierna
-    # acumulada, que crece, y colapsaba swings mayores en una diagonal larga).
-    my $atr_vals = $self->{atr} ? $self->{atr}->get_values : undef;
-    my $mult     = $self->{main_atr_mult};
-    my $dt       = $self->{main_dtop_atr};
-
-    my @m;
-    for my $p (@$raw) {
-        if (!@m) { push @m, $p; next; }
-        my $last = $m[-1];
-        my $atr  = ($atr_vals && defined $atr_vals->[$p->{index}])
-                 ? $atr_vals->[$p->{index}] : 0;
-
-        if ($p->{kind} eq $last->{kind}) {
-            # misma pierna: conservar el extremo mas relevante
-            my $more = ($p->{kind} eq 'H')
-                ? ($p->{price} > $last->{price})
-                : ($p->{price} < $last->{price});
-            $m[-1] = $p if $more;
-            next;
-        }
-
-        # DOBLE-TECHO / DOBLE-PISO (estructura de mercado): si p esta casi al
-        # mismo nivel que el pivote previo del MISMO lado (@m[-2]), es un RETEST
-        # de ese nivel, no una pierna nueva. Se IGNORA p para que la estructura
-        # tome despues el lower-high / higher-low que confirma el giro (evita
-        # que un maximo/minimo marginal tape al swing estructural real).
-        if (@m >= 2) {
-            my $eqtol = $atr * $dt;
-            if ($eqtol > 0 && abs($p->{price} - $m[-2]->{price}) <= $eqtol) {
-                next;
-            }
-        }
-
-        # lado opuesto: nueva pierna solo si la reversion es SIGNIFICATIVA
-        my $thr  = $atr * $mult;
-        my $move = abs($p->{price} - $last->{price});
-        push @m, $p if ($thr <= 0 || $move >= $thr);
-        # si no supera el umbral, se ignora (reversion menor, interna)
-    }
-    return \@m;
+    # La linea externa (azul) es ahora el ZigZag causal estilo TradingView que
+    # se mantiene incrementalmente en _update_main_zigzag (portado de ZZMTF /
+    # ZigZag Volume Profile). Devolver directamente sus pivotes ya alternados.
+    return $self->{_zz_pivots};
 }
 sub processed_last    { return $#{ $_[0]->{_c} }; }
 
@@ -156,6 +126,8 @@ sub reset {
     $self->{_struct_swings}  = [];
     $self->{_seen_sh_idx}    = -1;
     $self->{_seen_sl_idx}    = -1;
+    $self->{_zz_dir}         = 0;
+    $self->{_zz_pivots}      = [];
     $self->{_last_hh} = $self->{_last_hl} = undef;
     $self->{_last_lh} = $self->{_last_ll} = undef;
     $self->{_bias}    = undef;
@@ -184,10 +156,67 @@ sub _process {
     push @{ $self->{_c} }, $c;
     my $i = $#{ $self->{_c} };
     $self->_update_swing_structure;
+    $self->_update_main_zigzag($i);
     $self->_detect_fvg($i);
     $self->_update_fvgs($i);
     $self->_update_obs($i);
     $self->_detect_bos_choch($i);
+}
+
+# -----------------------------------------------------------------------------
+# _update_main_zigzag: ZigZag EXTERNO estilo TradingView (linea azul mayor).
+# Portado de ZZMTF (© LonesomeTheBlue) y ZigZag Volume Profile (© ChartPrime).
+# Cada vela puede ser swing-high (su high es el mayor de las ultimas main_prd
+# velas) y/o swing-low (su low es el menor). La direccion cambia al aparecer un
+# nuevo extremo del lado opuesto y cada cambio fija un pivote alternado; la
+# pierna en curso se extiende hasta su extremo. CAUSAL (solo mira hacia atras)
+# -> sin fuga de futuro, valido en replay. Se calcula 1 vez por vela.
+# -----------------------------------------------------------------------------
+sub _update_main_zigzag {
+    my ($self, $i) = @_;
+    my $c   = $self->{_c};
+    my $cur = $c->[$i];
+    my $hi  = $cur->{high};
+    my $lo  = $cur->{low};
+
+    # ¿es la vela actual el mayor high / menor low de las ultimas main_prd?
+    # (equivale a ta.highest/ta.lowest con highestbars/lowestbars == 0)
+    my $start = $i - $self->{main_prd} + 1;
+    $start = 0 if $start < 0;
+    my ($is_ph, $is_pl) = (1, 1);
+    for (my $j = $start; $j < $i; $j++) {
+        my $o = $c->[$j];
+        $is_ph = 0 if $o->{high} >= $hi;
+        $is_pl = 0 if $o->{low}  <= $lo;
+        last if !$is_ph && !$is_pl;
+    }
+    return unless $is_ph || $is_pl;
+
+    my $dir_prev = $self->{_zz_dir};
+    my $dir      = $dir_prev;
+    if    ($is_ph && !$is_pl) { $dir =  1; }
+    elsif ($is_pl && !$is_ph) { $dir = -1; }
+    return if $dir == 0;   # aun sin direccion definida (arranque)
+
+    my $piv   = $self->{_zz_pivots};
+    my $kind  = ($dir == 1) ? 'H' : 'L';
+    my $price = ($dir == 1) ? $hi : $lo;
+
+    if ($dir != $dir_prev || !@$piv) {
+        # cambio de direccion (o primer pivote) -> NUEVA pierna del zigzag
+        push @$piv, { kind => $kind, index => $i, price => $price, ts => $cur->{ts} };
+        $self->{_zz_dir} = $dir;
+    } else {
+        # misma direccion -> EXTENDER el pivote en curso hasta su extremo
+        my $last = $piv->[-1];
+        my $more = ($kind eq 'H') ? ($price > $last->{price})
+                                  : ($price < $last->{price});
+        if ($more) {
+            $last->{index} = $i;
+            $last->{price} = $price;
+            $last->{ts}    = $cur->{ts};
+        }
+    }
 }
 
 # -----------------------------------------------------------------------------

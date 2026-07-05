@@ -101,21 +101,29 @@ sub _bucket_ts_for {
              + SESSION_OPEN_SEC + LOCAL_OFFSET_SEC;
     }
 
-    # Fecha de CIERRE de la sesion a la que pertenece la vela: una vela con hora
-    # local >= 17:00 pertenece a la sesion que cierra al dia SIGUIENTE (p.ej.
-    # domingo 17:00 -> sesion del lunes). Se usa para D y W.
+    # Sesion CME a la que pertenece la vela (17:00 -> 16:00 del dia siguiente),
+    # etiquetada por su TRADE DATE = fecha de CIERRE (convencion CME/TradingView):
+    #   * hora local >= 17:00  -> la sesion CIERRA manana (trade date = manana).
+    #   * hora local <  17:00  -> la sesion CIERRA hoy    (trade date = hoy).
     my $tm    = Time::Moment->from_epoch($ts)->with_offset_same_instant(GMT_OFFSET_MIN);
     my $mins  = $tm->hour * 60 + $tm->minute;
     my $close = ($mins >= SESSION_OPEN_MIN) ? $tm->plus_days(1) : $tm;
 
     if ($tf eq 'D') {
-        # Un dia = una sesion (17:00 -> 16:00), etiquetado por su fecha de cierre.
+        # Un dia = una sesion (17:00 -> 16:00 del dia siguiente), etiquetado por
+        # su TRADE DATE (fecha de cierre) -- asi las FECHAS de 1D coinciden con
+        # TradingView para futuros CME. El color de dias sueltos como 7-may /
+        # 4-jun difiere de TV por el FEED de datos / sesion RTH, NO por el
+        # bucketing: se probo por fuerza bruta que ningun criterio de agrupacion
+        # diaria sobre este CSV los pone verdes a ambos a la vez.
         return $self->_truncate_to_midnight($close)->epoch;
     }
 
     if ($tf eq 'W') {
-        # Una semana = sesiones de lunes a viernes (domingo 17:00 -> viernes
-        # 16:00), etiquetada por el LUNES de la semana de la fecha de cierre.
+        # Una semana = sesiones de domingo 17:00 -> viernes 16:00, etiquetada por
+        # el LUNES de la semana. Se agrupa por la fecha de CIERRE (lunes..viernes,
+        # cuyo lunes ISO es estable), de modo que la vela del domingo por la tarde
+        # (cierra el lunes) cae correctamente en la semana que ABRE ese domingo.
         my $dow = $close->day_of_week;   # 1=Lunes .. 7=Domingo (ISO 8601)
         return $self->_truncate_to_midnight($close)->minus_days($dow - 1)->epoch;
     }

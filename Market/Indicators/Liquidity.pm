@@ -104,6 +104,14 @@ sub new {
         _open_level_refs      => [],   # niveles en DETECTED o SWEPT (working set)
         _next_id               => 1,
         _last_evaluated_index  => -1,  # ultimo candidato de swing ya evaluado
+
+        # Agregados del working set para el FAST-SKIP de la maquina de estados
+        # (ver _update_state_machine). Permiten saltar en O(1) las velas en las
+        # que ningun nivel puede transicionar, sin recorrer los ~150 niveles.
+        _ws_dirty    => 1,      # los agregados necesitan recomputo
+        _ws_min_buy  => 9e18,   # menor precio entre DETECTED buy  (+inf si no hay)
+        _ws_max_sell => -9e18,  # mayor precio entre DETECTED sell (-inf si no hay)
+        _ws_active   => 0,      # nº de niveles SWEPT/RECLAIMED pendientes
     };
 
     die "Market::Indicators::Liquidity: acceptance_n debe ser > grab_window "
@@ -126,6 +134,10 @@ sub reset {
     $self->{_open_level_refs}     = [];
     $self->{_next_id}             = 1;
     $self->{_last_evaluated_index} = -1;
+    $self->{_ws_dirty}    = 1;
+    $self->{_ws_min_buy}  = 9e18;
+    $self->{_ws_max_sell} = -9e18;
+    $self->{_ws_active}   = 0;
 }
 
 # -----------------------------------------------------------------------------
@@ -301,6 +313,10 @@ sub _register_swing {
         splice( @$refs, 0, @$refs - $self->{max_open_levels} );
     }
 
+    # El working set cambio (nuevo nivel / cap): los agregados del fast-skip
+    # deben recomputarse antes de la proxima evaluacion de la maquina de estados.
+    $self->{_ws_dirty} = 1;
+
     $self->_check_equal_levels( $kind, $swing );
 }
 
@@ -453,12 +469,37 @@ sub _update_state_machine {
 
     my $ch = $candle->{high};
     my $cl = $candle->{low};
+
+    # Si el working set cambio desde el ultimo escaneo (nuevo nivel / cap),
+    # recomputar los agregados que gobiernan el fast-skip.
+    $self->_recompute_ws_aggregates if $self->{_ws_dirty};
+
+    # ---- FAST-SKIP (O(1)) ----------------------------------------------------
+    # Ningun nivel puede transicionar en esta vela cuando:
+    #   * no hay niveles SWEPT/RECLAIMED pendientes (esos dependen del tiempo y
+    #     hay que revisarlos cada vela), y
+    #   * el maximo de la vela no supera el DETECTED buy mas bajo (un buy solo
+    #     se barre si ch > su precio), y
+    #   * el minimo de la vela no perfora el DETECTED sell mas alto (un sell
+    #     solo se barre si cl < su precio).
+    # En ese caso se evita recorrer los ~150 niveles del working set. Es
+    # EXACTAMENTE equivalente al escaneo completo (que no habria producido
+    # ninguna transicion ni evento).
+    return if $self->{_ws_active} == 0
+           && $ch <= $self->{_ws_min_buy}
+           && $cl >= $self->{_ws_max_sell};
+
     my $cc = $candle->{close};
     my $gw = $self->{grab_window};
     my $an = $self->{acceptance_n};
     my $cw = $self->{continuation_window};
 
+    # Se reconstruye el working set y, en la misma pasada, los agregados del
+    # fast-skip segun el estado RESULTANTE de cada nivel.
     my @still_open;
+    my $min_buy  = 9e18;
+    my $max_sell = -9e18;
+    my $active   = 0;
     for my $level ( @{ $self->{_open_level_refs} } ) {
         my $buy = ( $level->{side} eq 'buy' );
         my $price = $level->{price};
@@ -503,9 +544,55 @@ sub _update_state_machine {
             }
         }
 
-        push @still_open, $level unless $level->{state} eq 'RESOLVED';
+        next if $level->{state} eq 'RESOLVED';
+        push @still_open, $level;
+
+        # Agregados para el fast-skip de la proxima vela, segun estado final.
+        if ( $level->{state} eq 'DETECTED' ) {
+            if ( $level->{side} eq 'buy' ) {
+                $min_buy = $level->{price} if $level->{price} < $min_buy;
+            } else {
+                $max_sell = $level->{price} if $level->{price} > $max_sell;
+            }
+        } else {
+            $active++;   # SWEPT o RECLAIMED: siempre revisar la proxima vela
+        }
     }
     $self->{_open_level_refs} = \@still_open;
+    $self->{_ws_min_buy}  = $min_buy;
+    $self->{_ws_max_sell} = $max_sell;
+    $self->{_ws_active}   = $active;
+    $self->{_ws_dirty}    = 0;
+}
+
+# -----------------------------------------------------------------------------
+# _recompute_ws_aggregates (privado)
+# Recalcula los agregados del working set (menor DETECTED buy, mayor DETECTED
+# sell, nº de niveles pendientes) que gobiernan el fast-skip de la maquina de
+# estados. Se invoca cuando el working set fue modificado fuera del escaneo
+# (alta de nivel / cap), marcado por _ws_dirty.
+# -----------------------------------------------------------------------------
+sub _recompute_ws_aggregates {
+    my ($self) = @_;
+    my $min_buy  = 9e18;
+    my $max_sell = -9e18;
+    my $active   = 0;
+    for my $level ( @{ $self->{_open_level_refs} } ) {
+        my $st = $level->{state};
+        if ( $st eq 'DETECTED' ) {
+            if ( $level->{side} eq 'buy' ) {
+                $min_buy = $level->{price} if $level->{price} < $min_buy;
+            } else {
+                $max_sell = $level->{price} if $level->{price} > $max_sell;
+            }
+        } elsif ( $st ne 'RESOLVED' ) {
+            $active++;
+        }
+    }
+    $self->{_ws_min_buy}  = $min_buy;
+    $self->{_ws_max_sell} = $max_sell;
+    $self->{_ws_active}   = $active;
+    $self->{_ws_dirty}    = 0;
 }
 
 # -----------------------------------------------------------------------------

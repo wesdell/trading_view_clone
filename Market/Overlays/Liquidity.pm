@@ -217,7 +217,8 @@ sub _render_events {
     my $start = $#$events - MAX_EVENTS;
     $start = 0 if $start < 0;
 
-    my @drawn;   # [x, y, type] de eventos ya dibujados (anti-repeticion)
+    my %by_it;    # "index:type" ya dibujado -> UNA etiqueta por vela y tipo
+    my @drawn;    # [x, y, type] de eventos ya dibujados (anti-repeticion)
     for ( my $k = $#$events ; $k >= $start ; $k-- ) {
         my $ev = $events->[$k];
         my $t  = $ev->{type};
@@ -228,14 +229,21 @@ sub _render_events {
         next if $ev->{index} < $off || $ev->{index} > $off + $vb;
         next unless $scale->value_in_range( $ev->{price} );
 
+        # Anti-repeticion 1 (LA MISMA VELA): varios niveles de liquidez pueden
+        # resolverse (sweep/grab/run) en la MISMA vela a precios distintos; antes
+        # se dibujaba una etiqueta por cada nivel -> se amontonaban en la misma
+        # vela. Se permite como maximo UNA etiqueta por (vela, tipo); como se
+        # recorre de mas reciente a mas antiguo, se conserva la mas nueva.
+        my $itkey = $ev->{index} . ':' . $t;
+        next if $by_it{$itkey}++;
+
         my $x = $scale->index_to_center_x( $ev->{index} );
         my $y = $scale->value_to_y( $ev->{price} );
 
-        # Anti-repeticion: si ya se dibujo un evento del MISMO tipo muy cerca,
-        # se omite. Evita la maraña de etiquetas Sweep/Grab/Run repetidas sobre
-        # la misma zona de liquidez (spec 15: tratar señales dentro de la misma
-        # tolerancia como una sola). Se recorre de mas reciente a mas antiguo,
-        # asi que se conserva el evento mas nuevo de cada cluster.
+        # Anti-repeticion 2: si ya se dibujo un evento del MISMO tipo muy cerca
+        # (velas contiguas), se omite. Evita la maraña de etiquetas Sweep/Grab/
+        # Run repetidas sobre la misma zona de liquidez (spec 15: tratar señales
+        # dentro de la misma tolerancia como una sola).
         my $dup = 0;
         for my $d (@drawn) {
             next unless $d->[2] eq $t;

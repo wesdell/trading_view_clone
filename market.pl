@@ -172,16 +172,14 @@ my $smc_ind = Market::Indicators::SMC_Structures->new(
     # internos). Rango util aprox 1.5 (mas detalle) .. 3.5 (solo tramos
     # grandes). Ajustar aqui si el profesor quiere mas/menos estructura.
     struct_atr_mult => 2.5,
-    # Zigzag EXTERNO (azul, estructura mayor):
-    #  - main_atr_mult: umbral (en ATR) de la reversion que confirma una pierna.
-    #    Mas alto = linea mas gruesa (solo swings enormes); mas bajo = mas detalle.
-    #  - main_dtop_atr: tolerancia de DOBLE-TECHO/PISO. Si dos extremos del mismo
-    #    lado estan a <= main_dtop_atr*ATR, el 2o es un retest y NO cuenta como
-    #    pierna nueva -> la estructura toma el lower-high/higher-low posterior
-    #    (estructura de mercado, como pidio el usuario). Subirlo fusiona mas
-    #    (riesgo de juntar swings reales); bajarlo solo junta techos casi iguales.
-    main_atr_mult => 3.5,
-    main_dtop_atr => 1.0 );
+    # Zigzag EXTERNO (azul, estructura mayor) -- algoritmo de TradingView
+    # (ZZMTF © LonesomeTheBlue / ZigZag Volume Profile © ChartPrime). main_prd =
+    # "period"/"swingLength": la vela es pivote si su high/low es el mayor/menor
+    # de las ultimas main_prd VELAS. Mas alto = menos pivotes (menos ruido); mas
+    # bajo = mas detalle. Es conteo de velas: en temporalidades bajas (1m/5m/15m/
+    # 1h) hace falta un valor alto para que no sea ruidoso. 50 da una linea de
+    # estructura mayor limpia en esas temporalidades (bajarlo mete mucho ruido).
+    main_prd => 50 );
 
 $ind_manager->register('atr',       $atr_ind);
 $ind_manager->register('liquidity', $liq_ind);

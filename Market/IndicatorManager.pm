@@ -54,13 +54,15 @@ sub update_last {
 sub rebuild_all {
     my ($self, $market_data) = @_;
     my $size = $market_data->size;
+
+    # Resolver una sola vez la lista de indicadores que soportan update_at_index
+    # (en orden de registro), en vez de hacer un ->can() por vela y por
+    # indicador (cientos de miles de llamadas en datasets de 1m grandes).
+    my @inds = grep { $_->can('update_at_index') }
+               map  { $self->{indicators}{$_} } @{ $self->{_order} };
+
     for my $i (0 .. $size - 1) {
-        for my $name (@{ $self->{_order} }) {
-            my $ind = $self->{indicators}{$name};
-            if ($ind->can('update_at_index')) {
-                $ind->update_at_index($market_data, $i);
-            }
-        }
+        $_->update_at_index($market_data, $i) for @inds;
     }
 }
 
