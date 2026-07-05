@@ -284,7 +284,7 @@ sub draw_time_label {
         my ( $year, $month, $day, $hour, $min ) = ( $1, $2, $3, $4+0, $5+0 );
 
         my $ts   = $candle_info->{ts} // 0;
-        my $wday = ( gmtime( $ts + 5*3600 ) )[6];
+        my $wday = ( gmtime( $ts - 5*3600 ) )[6];
 
         my $dow = $days[$wday];
         my $mon = $months{$month} // $month;

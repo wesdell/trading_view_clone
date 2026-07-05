@@ -24,6 +24,8 @@ use Market::Indicators::Liquidity;
 use Market::Indicators::SMC_Structures;
 use Market::Overlays::SMC_Structures;
 use Market::Overlays::Liquidity;
+use Market::Indicators::ZigZag;
+use Market::Overlays::ZigZag;
 
 # =============================================================================
 # VENTANA
@@ -146,9 +148,10 @@ for my $paths (@csv_groups) {
 
 printf "Cargadas %d velas de 1m\n", $count;
 $market->build_timeframes;
-printf "5m: %d | 15m: %d | 1h: %d | 2h: %d | 4h: %d | D: %d | W: %d\n",
+printf "5m: %d | 15m: %d | 30m: %d | 1h: %d | 2h: %d | 4h: %d | D: %d | W: %d\n",
     scalar @{ $market->get_data->{'5m'} },
     scalar @{ $market->get_data->{'15m'} },
+    scalar @{ $market->get_data->{'30m'} },
     scalar @{ $market->get_data->{'1h'} },
     scalar @{ $market->get_data->{'2h'} },
     scalar @{ $market->get_data->{'4h'} },
@@ -162,9 +165,19 @@ my $ind_manager = Market::IndicatorManager->new;
 
 # El ORDEN de registro importa: en cada vela, rebuild/update procesa los
 # indicadores en este orden. Liquidity necesita el ATR ya calculado (tolerancia
-# EQH/EQL) y SMC_Structures necesita los swings ya confirmados por Liquidity.
+# EQH/EQL) y SMC_Structures usa Liquidity como fuente de HH/HL/LH/LL. ZigZag
+# (interno/externo) es un overlay independiente, activado por su propio
+# checkbox, sin relacion con HH/HL/LH/LL/BOS/CHOCH.
 my $atr_ind = Market::Indicators::ATR->new(14);
 my $liq_ind = Market::Indicators::Liquidity->new( atr => $atr_ind, k => 3 );
+
+# ZigZag interno: replica ZZMTF (Resolution=30min, Period=2)
+# ZigZag externo: replica ZigZag Volume Profile (Length=150 velas de la TF activa)
+my $zz_ind = Market::Indicators::ZigZag->new(
+    int_period  => 2,       # ZZMTF Period=2
+    int_tf_mins => 30,      # ZZMTF Resolution=30min => ventana=2*30=60 velas 1m
+    ext_length  => 150,     # ZigZag Volume Profile Length=150
+);
 my $smc_ind = Market::Indicators::SMC_Structures->new(
     liquidity => $liq_ind, atr => $atr_ind, max_age => 50,
     # structure_atr_factor: umbral (en ATR) para que un pivote entre en la
@@ -183,6 +196,7 @@ my $smc_ind = Market::Indicators::SMC_Structures->new(
 
 $ind_manager->register('atr',       $atr_ind);
 $ind_manager->register('liquidity', $liq_ind);
+$ind_manager->register('zigzag',    $zz_ind);
 $ind_manager->register('smc',       $smc_ind);
 
 print "Calculando indicadores (ATR, Liquidity, SMC)...\n";
@@ -205,6 +219,9 @@ my $smc_overlay = Market::Overlays::SMC_Structures->new(
 my $liq_overlay = Market::Overlays::Liquidity->new( source => $liq_ind );
 $overlay_mgr->register('smc',       $smc_overlay, visible => 0);
 $overlay_mgr->register('liquidity', $liq_overlay, visible => 0);
+
+my $zz_overlay = Market::Overlays::ZigZag->new( source => $zz_ind );
+$overlay_mgr->register('zigzag', $zz_overlay, visible => 0);
 
 # =============================================================================
 # PANELES Y MOTOR
@@ -723,6 +740,31 @@ $make_chk->($col_liq, 'EQL',     \$LIQ{show_eql},    $leaf_liq);
 $make_chk->($col_liq, 'Sweeps',  \$LIQ{show_sweeps}, $leaf_liq);
 $make_chk->($col_liq, 'Grabs',   \$LIQ{show_grabs},  $leaf_liq);
 $make_chk->($col_liq, 'Runs',    \$LIQ{show_runs},   $leaf_liq);
+
+# =============================================================================
+# Columna ZIGZAG (Interno verde/rojo + Externo azul)
+# =============================================================================
+my %ZZ = ( show_internal => 0, show_external => 0 );
+my $zz_master = 0;
+my $refresh_zz = sub {
+    $zz_overlay->set_flag($_, $ZZ{$_}) for keys %ZZ;
+    my $any = 0; $any ||= $ZZ{$_} for keys %ZZ;
+    $overlay_mgr->set_visible('zigzag', $any ? 1 : 0);
+    $engine->request_render;
+};
+my $sync_zz_master = sub {
+    my $all = 1; $all &&= $ZZ{$_} for keys %ZZ;
+    $zz_master = $all ? 1 : 0;
+};
+my $leaf_zz = sub { $refresh_zz->(); $sync_zz_master->(); };
+
+my $col_zz = $make_col->('ZigZag', '#1e88e5');
+$make_chk->($col_zz, 'Activar ZigZag', \$zz_master, sub {
+    $ZZ{$_} = $zz_master for keys %ZZ;
+    $refresh_zz->();
+});
+$make_chk->($col_zz, 'Interno (30m)',   \$ZZ{show_internal}, $leaf_zz);
+$make_chk->($col_zz, 'Externo (150)',   \$ZZ{show_external}, $leaf_zz);
 
 # =============================================================================
 # PRIMER RENDER
