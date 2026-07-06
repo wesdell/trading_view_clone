@@ -6,58 +6,11 @@ use warnings;
 sub new {
     my ($class, %args) = @_;
     my $self = {
-        liquidity          => $args{liquidity},
+        zigzag             => $args{zigzag},
         atr                => $args{atr},
         max_age            => $args{max_age}           // 50,
         min_fvg_atr_mult   => $args{min_fvg_atr_mult}  // 0.20,
         ob_proximity_mult  => $args{ob_proximity_mult}  // 6.0,
-
-        # --- Filtros de la linea estructural (ZigZag de ESTRUCTURA MAYOR) ---
-        # Una nueva pierna (pivote de lado opuesto) solo se acepta si el
-        # movimiento contra el pivote anterior supera struct_atr_mult*ATR y
-        # ademas hay al menos struct_min_bars velas de separacion. Los pivotes
-        # del mismo lado se fusionan conservando el extremo mas relevante, y la
-        # consistencia direccional descarta pivotes solapados. Con un umbral
-        # alto (~2.5) la linea representa la estructura mayor del mercado y los
-        # retrocesos internos NO la cortan (spec 1/7). Subir el factor => linea
-        # aun mas limpia; bajarlo => mas detalle. structure_atr_factor del PDF.
-        struct_atr_mult    => $args{struct_atr_mult}   // 2.5,
-        struct_min_bars    => $args{struct_min_bars}   // 3,
-        # Umbral (en ATR) de la REVERSION que confirma una nueva pierna del
-        # zigzag EXTERNO (get_main_struct / linea azul de estructura mayor). Una
-        # reversion contra el ultimo pivote menor a main_atr_mult*ATR se ignora
-        # (interna). Mas alto = linea externa mas gruesa/mayor; mas bajo = mas
-        # detalle. Sustituye al antiguo main_retrace (colapso greedy).
-        main_atr_mult      => $args{main_atr_mult}     // 3.5,
-        # Tolerancia (en ATR) para detectar DOBLE-TECHO / DOBLE-PISO en el
-        # zigzag externo: si un nuevo extremo esta a <= main_dtop_atr*ATR del
-        # pivote previo del mismo lado, es un RETEST del mismo nivel y NO se
-        # cuenta como pierna nueva -> la estructura toma el lower-high /
-        # higher-low posterior (estructura de mercado, no pico geometrico).
-        main_dtop_atr      => $args{main_dtop_atr}     // 1.0,
-
-        # --- ZigZag EXTERNO estilo TradingView (linea azul de estructura mayor)
-        # Portado de los indicadores de TradingView "ZZMTF" (© LonesomeTheBlue) y
-        # "ZigZag Volume Profile" (© ChartPrime): el pivote es CAUSAL -- la vela
-        # actual es swing-high si su high es el MAYOR de las ultimas main_prd
-        # velas (ta.highest / ta.lowest, highestbars==0), y swing-low si su low es
-        # el MENOR. La direccion (dir) cambia al aparecer un nuevo extremo del
-        # lado opuesto; cada cambio de direccion fija un pivote y la pierna en
-        # curso se extiende hasta su extremo. Sustituye al zigzag por umbral-ATR
-        # (que saltaba pivotes cuando el ATR daba un pico). main_prd = "period" de
-        # ZZMTF / "swingLength" del Volume Profile: mas alto => estructura mas
-        # mayor (menos pivotes). Sin fuga de futuro (solo mira hacia atras).
-        main_prd           => $args{main_prd}         // 30,
-
-        # Confirmacion por VOLUMEN de los pivotes estructurales (spec docente:
-        # "considerar volatilidad Y volumen"). Un pivote nuevo se acepta si el
-        # volumen de su vela supera volume_ma(volume_ma_period) * volume_factor.
-        # TOLERANTE: si el dataset no tiene volumen (promedio 0) no filtra. Solo
-        # afecta las etiquetas HH/HL/LH/LL (no sweep/grab/EQ). use_volume=0 lo
-        # desactiva.
-        use_volume         => defined $args{use_volume} ? $args{use_volume} : 1,
-        volume_ma_period   => $args{volume_ma_period}  // 20,
-        volume_factor      => $args{volume_factor}     // 1.0,
 
         _c            => [],
         _fvgs         => [],
@@ -66,53 +19,57 @@ sub new {
         _order_blocks => [],
         _active_obs   => [],
 
-        _struct_swings  => [],
-        _seen_sh_idx    => -1,
-        _seen_sl_idx    => -1,
+        # Las etiquetas HH/HL/LH/LL se derivan 1:1 de los segmentos del ZigZag
+        # INTERNO (verde/rojo) de Indicators::ZigZag -- esto NO se toca: el
+        # zigzag interno/externo (lineas verde-rojo y azul) sigue funcionando
+        # exactamente igual que antes de este cambio.
+        _struct => _mk_struct_state(),
 
-        # Estado del ZigZag externo estilo TradingView (ver main_prd).
-        _zz_dir     => 0,    # 0 = sin definir, 1 = alcista, -1 = bajista
-        _zz_pivots  => [],   # pivotes alternados {kind,index,price,ts}
-        _last_hh => undef, _last_hl => undef,
-        _last_lh => undef, _last_ll => undef,
-
-        _bias    => undef,
-        _bh_idx  => -1,
-        _bl_idx  => -1,
-        _new_sl_since_last_up   => 0,
-        _new_sh_since_last_down => 0,
+        # BOS/CHoCH: motor INDEPENDIENTE del zigzag interno/externo de arriba,
+        # portado directo del indicador de referencia (LuxAlgo "Smart Money
+        # Concepts"): pivote simetrico leg(size) + crossover/crossunder del
+        # cierre contra el ultimo pivote no cruzado. 'internal' (size=5) replica
+        # su "Internal Structure"; 'swing' (size=50) replica su "Swing
+        # Structure" (lo que aqui llamamos BOS/CHoCH externo). No depende de
+        # HH/HL/LH/LL ni de los pivotes del zigzag interno/externo.
+        _bos => {
+            internal => _mk_leg_state( $args{bos_internal_size} // 5 ),
+            external => _mk_leg_state( $args{bos_swing_size}    // 50 ),
+        },
     };
     bless $self, $class;
     return $self;
 }
 
+# _mk_struct_state: estado de los pivotes HH/HL/LH/LL espejados del zigzag interno.
+sub _mk_struct_state {
+    return {
+        swings    => [],
+        zz_seen_n => 0,   # cuantos segmentos del zigzag interno ya se copiaron
+    };
+}
+
+# _mk_leg_state: estado del motor BOS/CHoCH estilo LuxAlgo para un scope.
+# leg_dir: 0=BEARISH_LEG, 1=BULLISH_LEG (arranca en 0, igual que "var leg=0" de
+# Pine). pivot_high/pivot_low: {level,last,crossed,index} -- level es el precio
+# del pivote vigente (aun no roto); crossed evita relanzar el mismo evento.
+sub _mk_leg_state {
+    my ($size) = @_;
+    return {
+        size     => $size,
+        leg_dir  => 0,
+        pivot_hi => { level => undef, last => undef, crossed => 0, index => undef },
+        pivot_lo => { level => undef, last => undef, crossed => 0, index => undef },
+        trend    => undef,
+    };
+}
+
 sub get_values        { return []; }
 sub get_fvgs          { return $_[0]->{_fvgs}; }
 sub get_events        { return $_[0]->{_events}; }
-sub get_struct_swings { return $_[0]->{_struct_swings}; }
+sub get_struct_swings { return $_[0]->{_struct}{swings}; }
 sub get_order_blocks  { return $_[0]->{_order_blocks}; }
 
-# -----------------------------------------------------------------------------
-# get_main_struct: version COMPACTADA de _struct_swings para dibujar la LINEA
-# principal. Colapsa los pivotes internos de un tramo fuerte (spec 5/7):
-# mientras la tendencia sigue extendiendose (highs cada vez mas altos con lows
-# cada vez mas altos -- o lows mas bajos con highs mas bajos), los pivotes
-# intermedios se absorben y la linea une DIRECTAMENTE el origen con el extremo
-# principal (p.ej. LL -> HH directo, sin el HH/HL interno).
-#
-# Es un derivado de solo lectura: NO altera _struct_swings (que conserva el
-# detalle para BOS/CHoCH) ni las etiquetas HH/HL/LH/LL (que se siguen mostrando
-# sobre TODOS los pivotes crudos). Sin fuga de futuro: solo usa pivotes ya
-# confirmados. O(n) por llamada (n = pivotes estructurales), se calcula al
-# renderizar.
-# -----------------------------------------------------------------------------
-sub get_main_struct {
-    my ($self) = @_;
-    # La linea externa (azul) es ahora el ZigZag causal estilo TradingView que
-    # se mantiene incrementalmente en _update_main_zigzag (portado de ZZMTF /
-    # ZigZag Volume Profile). Devolver directamente sus pivotes ya alternados.
-    return $self->{_zz_pivots};
-}
 sub processed_last    { return $#{ $_[0]->{_c} }; }
 
 sub reset {
@@ -123,18 +80,11 @@ sub reset {
     $self->{_events}       = [];
     $self->{_order_blocks} = [];
     $self->{_active_obs}   = [];
-    $self->{_struct_swings}  = [];
-    $self->{_seen_sh_idx}    = -1;
-    $self->{_seen_sl_idx}    = -1;
-    $self->{_zz_dir}         = 0;
-    $self->{_zz_pivots}      = [];
-    $self->{_last_hh} = $self->{_last_hl} = undef;
-    $self->{_last_lh} = $self->{_last_ll} = undef;
-    $self->{_bias}    = undef;
-    $self->{_bh_idx}  = -1;
-    $self->{_bl_idx}  = -1;
-    $self->{_new_sl_since_last_up}   = 0;
-    $self->{_new_sh_since_last_down} = 0;
+    $self->{_struct}       = _mk_struct_state();
+    $self->{_bos} = {
+        internal => _mk_leg_state( $self->{_bos}{internal}{size} ),
+        external => _mk_leg_state( $self->{_bos}{external}{size} ),
+    };
 }
 
 sub update_at_index {
@@ -155,8 +105,7 @@ sub _process {
     my ($self, $c) = @_;
     push @{ $self->{_c} }, $c;
     my $i = $#{ $self->{_c} };
-    $self->_update_swing_structure;
-    $self->_update_main_zigzag($i);
+    $self->_sync_from_zigzag;
     $self->_detect_fvg($i);
     $self->_update_fvgs($i);
     $self->_update_obs($i);
@@ -164,180 +113,78 @@ sub _process {
 }
 
 # -----------------------------------------------------------------------------
-# _update_main_zigzag: ZigZag EXTERNO estilo TradingView (linea azul mayor).
-# Portado de ZZMTF (© LonesomeTheBlue) y ZigZag Volume Profile (© ChartPrime).
-# Cada vela puede ser swing-high (su high es el mayor de las ultimas main_prd
-# velas) y/o swing-low (su low es el menor). La direccion cambia al aparecer un
-# nuevo extremo del lado opuesto y cada cambio fija un pivote alternado; la
-# pierna en curso se extiende hasta su extremo. CAUSAL (solo mira hacia atras)
-# -> sin fuga de futuro, valido en replay. Se calcula 1 vez por vela.
+# _sync_from_zigzag: _struct_swings (HH/HL/LH/LL) espeja 1:1 los segmentos del
+# ZigZag INTERNO (verde/rojo) de Indicators::ZigZag (get_segments('internal')).
+# SOLO alimenta las etiquetas HH/HL/LH/LL -- el BOS/CHoCH ya NO depende de esto
+# (ver _detect_bos_choch, motor propio estilo LuxAlgo). No toca el zigzag
+# interno/externo en si (Indicators::ZigZag), que sigue intacto.
 # -----------------------------------------------------------------------------
-sub _update_main_zigzag {
-    my ($self, $i) = @_;
-    my $c   = $self->{_c};
-    my $cur = $c->[$i];
-    my $hi  = $cur->{high};
-    my $lo  = $cur->{low};
-
-    # ¿es la vela actual el mayor high / menor low de las ultimas main_prd?
-    # (equivale a ta.highest/ta.lowest con highestbars/lowestbars == 0)
-    my $start = $i - $self->{main_prd} + 1;
-    $start = 0 if $start < 0;
-    my ($is_ph, $is_pl) = (1, 1);
-    for (my $j = $start; $j < $i; $j++) {
-        my $o = $c->[$j];
-        $is_ph = 0 if $o->{high} >= $hi;
-        $is_pl = 0 if $o->{low}  <= $lo;
-        last if !$is_ph && !$is_pl;
-    }
-    return unless $is_ph || $is_pl;
-
-    my $dir_prev = $self->{_zz_dir};
-    my $dir      = $dir_prev;
-    if    ($is_ph && !$is_pl) { $dir =  1; }
-    elsif ($is_pl && !$is_ph) { $dir = -1; }
-    return if $dir == 0;   # aun sin direccion definida (arranque)
-
-    my $piv   = $self->{_zz_pivots};
-    my $kind  = ($dir == 1) ? 'H' : 'L';
-    my $price = ($dir == 1) ? $hi : $lo;
-
-    if ($dir != $dir_prev || !@$piv) {
-        # cambio de direccion (o primer pivote) -> NUEVA pierna del zigzag
-        push @$piv, { kind => $kind, index => $i, price => $price, ts => $cur->{ts} };
-        $self->{_zz_dir} = $dir;
-    } else {
-        # misma direccion -> EXTENDER el pivote en curso hasta su extremo
-        my $last = $piv->[-1];
-        my $more = ($kind eq 'H') ? ($price > $last->{price})
-                                  : ($price < $last->{price});
-        if ($more) {
-            $last->{index} = $i;
-            $last->{price} = $price;
-            $last->{ts}    = $cur->{ts};
-        }
-    }
-}
-
-# -----------------------------------------------------------------------------
-# _update_swing_structure: construye una linea estructural LIMPIA y ALTERNADA
-# (ZigZag) a partir de los swings confirmados por Liquidity.
-#
-# La causa del "ruido" no eran los swings (ya vienen filtrados por ATR), sino
-# que ANTES cada swing se convertia directamente en un pivote de la linea. Aqui,
-# en cambio, la lista _struct_swings mantiene la invariante de ALTERNANCIA
-# (H, L, H, L, ...) aplicando dos reglas (spec 7 y 26):
-#   1) Swing del MISMO lado que el ultimo pivote -> es la misma pierna: se
-#      conserva el mas relevante (high mas alto / low mas bajo), reemplazando.
-#   2) Swing del lado OPUESTO -> posible pierna nueva: solo se acepta si el
-#      movimiento supera struct_atr_mult*ATR y hay struct_min_bars de
-#      separacion; si no, es un micro-movimiento y se descarta.
-# Las etiquetas HH/HL/LH/LL y los niveles _last_* (que usa _detect_bos_choch)
-# se derivan siempre de esta lista ya limpia.
-# -----------------------------------------------------------------------------
-sub _update_swing_structure {
+sub _sync_from_zigzag {
     my ($self) = @_;
-    my $liq = $self->{liquidity};
-    return unless $liq;
+    my $zz = $self->{zigzag};
+    return unless $zz;
 
-    # Recolectar los swings recien confirmados en este tick.
-    my @incoming;
-    my $sh = $liq->last_swing_high;
-    if ($sh && $sh->{index} != $self->{_seen_sh_idx}) {
-        push @incoming, { kind => 'H', index => $sh->{index},
-                          price => $sh->{price}, ts => $sh->{ts} };
-        $self->{_seen_sh_idx} = $sh->{index};
+    my $segs = $zz->get_segments('internal');
+    return unless $segs && @$segs;
+
+    my $st = $self->{_struct};
+
+    # Indicators::ZigZag::update_at_index no esta parametrizado por el indice
+    # de este tick: usa $md->last_index, que en un rebuild_all SIN frontera de
+    # replay devuelve el ULTIMO indice de TODO el dataset ya cargado. Por eso
+    # sus segmentos pueden materializarse de golpe muy por delante de este
+    # indicador (que si avanza vela a vela via _c). Para no adelantarnos,
+    # solo se copian/extienden segmentos cuyo ts NO supere la ultima vela ya
+    # vista en _c -- el resto se sincroniza en ticks posteriores conforme _c
+    # los va alcanzando.
+    my $now_ts = $self->{_c}[-1]{ts};
+    my $list   = $st->{swings};
+    my $n      = scalar @$segs;
+
+    while ($st->{zz_seen_n} < $n) {
+        my $seg = $segs->[ $st->{zz_seen_n} ];
+        last if $seg->{ts} > $now_ts;
+        my $idx = $self->_ts_to_index($seg->{ts});
+        push @$list, _mk_pivot({ kind  => $seg->{kind}, index => $idx,
+                                  price => $seg->{price}, ts => $seg->{ts} });
+        $self->_relabel_last;
+        $st->{zz_seen_n}++;
     }
-    my $sl = $liq->last_swing_low;
-    if ($sl && $sl->{index} != $self->{_seen_sl_idx}) {
-        push @incoming, { kind => 'L', index => $sl->{index},
-                          price => $sl->{price}, ts => $sl->{ts} };
-        $self->{_seen_sl_idx} = $sl->{index};
-    }
-    return unless @incoming;
+    return if $st->{zz_seen_n} < $n;   # aun quedan segmentos "futuros" por alcanzar
 
-    # Procesar en orden de indice (un mismo tick puede confirmar H y L).
-    for my $sw (sort { $a->{index} <=> $b->{index} } @incoming) {
-        $self->_add_structural_pivot($sw);
-    }
-}
-
-# -----------------------------------------------------------------------------
-# _add_structural_pivot: aplica las reglas de alternancia/relevancia/ATR.
-# -----------------------------------------------------------------------------
-sub _add_structural_pivot {
-    my ($self, $sw) = @_;
-    my $list = $self->{_struct_swings};
-
-    if (!@$list) {
-        push @$list, _mk_pivot($sw);
-        $self->_after_struct_change($sw->{kind});
-        return;
-    }
-
+    my $seg = $segs->[-1];
+    return if $seg->{ts} > $now_ts;
     my $last = $list->[-1];
+    return unless $last;
+    return if $seg->{price} == $last->{price} && $seg->{ts} == $last->{ts};
 
-    # Regla 1: mismo lado -> misma pierna, conservar el extremo mas relevante.
-    if ($last->{kind} eq $sw->{kind}) {
-        my $more_extreme = ($sw->{kind} eq 'H')
-            ? ($sw->{price} > $last->{price})
-            : ($sw->{price} < $last->{price});
-        if ($more_extreme) {
-            $list->[-1] = _mk_pivot($sw);
-            $self->_after_struct_change($sw->{kind});
-        }
-        return;   # menos extremo => ruido de la misma pierna, se ignora
-    }
-
-    # Regla 2: lado opuesto -> posible pierna nueva.
-
-    # 2a) Consistencia direccional: en un zigzag, un pivote L debe quedar por
-    # DEBAJO del H anterior (y un H por ENCIMA del L anterior). En rangos
-    # solapados la liquidez puede confirmar un "low" por encima del high previo
-    # (o viceversa): dibujar esa pierna daria un segmento invertido/plano
-    # (ruido). Se ignora y se deja que el pivote actual se extienda con un swing
-    # del mismo lado (p.ej. el siguiente high mas alto reemplaza al high vigente).
-    my $dir_ok = ($sw->{kind} eq 'L')
-        ? ($sw->{price} < $last->{price})
-        : ($sw->{price} > $last->{price});
-    return unless $dir_ok;
-
-    # 2b) Significancia: el movimiento debe superar struct_atr_mult*ATR y haber
-    # al menos struct_min_bars velas de separacion (evita micro-piernas).
-    my $atr_vals = $self->{atr} ? $self->{atr}->get_values : undef;
-    my $atr_val  = ($atr_vals && defined $atr_vals->[$sw->{index}])
-                 ? $atr_vals->[$sw->{index}] : 0;
-    my $min_leg  = $atr_val * $self->{struct_atr_mult};
-
-    my $move = abs($sw->{price} - $last->{price});
-    my $bars = $sw->{index} - $last->{index};
-    return if ($min_leg > 0 && $move < $min_leg);
-    return if ($bars < $self->{struct_min_bars});
-
-    # 2c) Confirmacion por VOLUMEN: el pivote gana validez si su vela tiene
-    # volumen >= promedio_reciente * volume_factor (tolerante si no hay volumen).
-    return if ($self->{use_volume} && !$self->_volume_ok($sw->{index}));
-
-    push @$list, _mk_pivot($sw);
-    $self->_after_struct_change($sw->{kind});
+    $last->{price} = $seg->{price};
+    $last->{ts}    = $seg->{ts};
+    $last->{index} = $self->_ts_to_index($seg->{ts});
+    $self->_relabel_last;
 }
 
 # -----------------------------------------------------------------------------
-# _volume_ok: 1 si la vela $idx tiene volumen >= volume_ma * volume_factor.
-# Tolerante: si no hay datos de volumen (promedio 0) devuelve 1 (usa solo ATR).
+# _ts_to_index: indice en _c (aligned 1:1 con la TF activa que usa el ZigZag
+# interno, ver market.pl: ambos se recorren en el mismo orden en rebuild_all)
+# cuyo ts es el mas cercano (sin pasarse) a $ts_target. Busqueda binaria, igual
+# criterio que Overlays::ZigZag::_ts_to_active_idx.
 # -----------------------------------------------------------------------------
-sub _volume_ok {
-    my ($self, $idx) = @_;
+sub _ts_to_index {
+    my ($self, $ts_target) = @_;
     my $c = $self->{_c};
-    return 1 if $idx < 0 || $idx > $#$c;
-    my $lo = $idx - $self->{volume_ma_period} + 1;
-    $lo = 0 if $lo < 0;
-    my ($sum, $n) = (0, 0);
-    for my $j ($lo .. $idx) { $sum += ($c->[$j]{volume} // 0); $n++; }
-    return 1 if $n == 0;
-    my $ma = $sum / $n;
-    return 1 if $ma <= 0;   # sin volumen -> no filtra
-    return (($c->[$idx]{volume} // 0) >= $ma * $self->{volume_factor}) ? 1 : 0;
+    my ($lo, $hi) = (0, $#$c);
+    return 0 if $hi < 0;
+    return 0 if $c->[0]{ts} > $ts_target;
+    return $hi if $c->[$hi]{ts} <= $ts_target;
+
+    my $found = 0;
+    while ($lo <= $hi) {
+        my $mid = int(($lo + $hi) / 2);
+        if ($c->[$mid]{ts} <= $ts_target) { $found = $mid; $lo = $mid + 1; }
+        else                              { $hi = $mid - 1; }
+    }
+    return $found;
 }
 
 # _mk_pivot: crea el pivote; la etiqueta final la fija _relabel_last.
@@ -351,21 +198,12 @@ sub _mk_pivot {
     };
 }
 
-# _after_struct_change: reetiqueta el ultimo pivote, refresca los niveles
-# estructurales vigentes y marca que hubo un swing nuevo de ese lado.
-sub _after_struct_change {
-    my ($self, $kind) = @_;
-    $self->_relabel_last;
-    $self->_recompute_last_levels;
-    if ($kind eq 'H') { $self->{_new_sh_since_last_down} = 1; }
-    else              { $self->{_new_sl_since_last_up}   = 1; }
-}
-
 # _relabel_last: HH/LH (o HL/LL) comparando el ultimo pivote contra el pivote
-# previo del MISMO tipo en la lista ya limpia.
+# previo del MISMO tipo en la lista ya limpia. Solo alimenta las etiquetas
+# mostradas sobre el zigzag interno (el BOS/CHoCH ya no lee estos niveles).
 sub _relabel_last {
     my ($self) = @_;
-    my $list = $self->{_struct_swings};
+    my $list = $self->{_struct}{swings};
     return unless @$list;
     my $cur = $list->[-1];
 
@@ -379,28 +217,6 @@ sub _relabel_last {
     } else {
         $cur->{label} = (!$prev || $cur->{price} < $prev->{price}) ? 'LL' : 'HL';
     }
-}
-
-# _recompute_last_levels: deja en _last_hh/_last_hl/_last_lh/_last_ll el pivote
-# mas reciente de cada etiqueta (los consume _detect_bos_choch). Recorre la
-# lista DESDE EL FINAL y corta en cuanto encuentra los 4 -> O(k) amortizado en
-# vez de O(n), clave para que el rebuild completo del replay no congele la GUI.
-sub _recompute_last_levels {
-    my ($self) = @_;
-    my ($hh, $hl, $lh, $ll);
-    my $list = $self->{_struct_swings};
-    for (my $j = $#$list; $j >= 0; $j--) {
-        my $p   = $list->[$j];
-        my $lab = $p->{label};
-        my $ref = { index => $p->{index}, price => $p->{price} };
-        if    ($lab eq 'HH') { $hh //= $ref; }
-        elsif ($lab eq 'LH') { $lh //= $ref; }
-        elsif ($lab eq 'HL') { $hl //= $ref; }
-        elsif ($lab eq 'LL') { $ll //= $ref; }
-        last if $hh && $hl && $lh && $ll;
-    }
-    $self->{_last_hh} = $hh; $self->{_last_hl} = $hl;
-    $self->{_last_lh} = $lh; $self->{_last_ll} = $ll;
 }
 
 # -----------------------------------------------------------------------------
@@ -472,74 +288,103 @@ sub _update_fvgs {
 }
 
 # -----------------------------------------------------------------------------
-# _detect_bos_choch: usa niveles HH/HL/LH/LL correctos segun el sesgo.
-#
-# Sesgo BAJISTA  → CHoCH bull si close > LH   /  BOS bear si close < LL
-# Sesgo ALCISTA  → CHoCH bear si close < HL   /  BOS bull si close > HH
-# Sin sesgo      → primer evento en cualquier dir establece el sesgo
-#
-# Cooldown anti-duplicado: entre dos BOS del mismo sentido debe haberse
-# formado al menos UN swing en la direction contraria.
+# _detect_bos_choch: motor BOS/CHoCH independiente del ZigZag interno/externo
+# de arriba, portado directo de LuxAlgo "Smart Money Concepts" (ver
+# leg()/getCurrentStructure()/displayStructure() en el Pine original).
+# Dos scopes con estado propio: 'internal' (size=5, su "Internal Structure") y
+# 'external' (size=50, su "Swing Structure" -- lo que aqui llamamos externo).
 # -----------------------------------------------------------------------------
 sub _detect_bos_choch {
     my ($self, $i) = @_;
-    my $cur  = $self->{_c}[$i];
-    my $bias = $self->{_bias};
+    $self->_update_leg_scope($i, 'internal');
+    $self->_update_leg_scope($i, 'external');
+}
 
-    # === CONDICION ALCISTA: close por encima de un nivel estructural ===
-    {
-        my ($ref, $type);
+# -----------------------------------------------------------------------------
+# _update_leg_scope: replica leg(size) + getCurrentStructure() +
+# displayStructure() de LuxAlgo para un scope.
+#
+# leg(size): la vela 'size' velas atras es un pivote HIGH confirmado si su high
+# supera al high mas alto de las 'size' velas siguientes (sin contarla a ella
+# misma); simetricamente para el pivote LOW. Solo se registra pivote nuevo
+# cuando la direccion (leg_dir) CAMBIA respecto al bar anterior -- por eso el
+# pivote queda "confirmado" recien 'size' velas despues de formarse (igual
+# demora que en TradingView, no hay fuga de futuro).
+#
+# displayStructure(): en CADA vela se prueba cruce del close contra el ultimo
+# pivote alto/bajo aun no cruzado ('crossed'=0); el tipo es CHoCH si contradice
+# la tendencia vigente del scope, BOS si la confirma. 'crossed' evita relanzar
+# el mismo evento hasta que un pivote nuevo lo reemplace.
+# -----------------------------------------------------------------------------
+sub _update_leg_scope {
+    my ($self, $i, $scope) = @_;
+    my $st   = $self->{_bos}{$scope};
+    my $size = $st->{size};
+    my $c    = $self->{_c};
 
-        if (defined $bias && $bias eq 'bear') {
-            # CHoCH bull: rompemos el ultimo LH
-            $ref  = $self->{_last_lh};
-            $type = 'CHoCH';
-        } elsif (!defined $bias || $bias eq 'bull') {
-            # BOS bull: rompemos el ultimo HH (requiere nuevo SL previo)
-            $ref  = $self->{_last_hh};
-            $type = 'BOS';
+    if ($i >= $size) {
+        my ($hi_max, $lo_min) = ($c->[$i]{high}, $c->[$i]{low});
+        for (my $j = $i - $size + 1; $j < $i; $j++) {
+            $hi_max = $c->[$j]{high} if $c->[$j]{high} > $hi_max;
+            $lo_min = $c->[$j]{low}  if $c->[$j]{low}  < $lo_min;
         }
+        my $cand          = $c->[$i - $size];
+        my $new_leg_high  = ($cand->{high} > $hi_max);
+        my $new_leg_low   = ($cand->{low}  < $lo_min);
 
-        if ($ref && $ref->{index} != $self->{_bh_idx}
-            && $cur->{close} > $ref->{price}
-            && (!defined $bias || $self->{_new_sl_since_last_up}))
-        {
-            $self->_emit($type, 'up', $i, $ref->{price}, $ref->{index});
-            $self->{_bias}   = 'bull';
-            $self->{_bh_idx} = $ref->{index};
-            $self->{_new_sl_since_last_up} = 0;
-            return;   # un evento por vela
+        my $prev_dir = $st->{leg_dir};
+        my $dir      = $prev_dir;
+        $dir = 0 if $new_leg_high;   # BEARISH_LEG (pivote alto confirmado)
+        $dir = 1 if $new_leg_low;    # BULLISH_LEG (pivote bajo confirmado)
+        $st->{leg_dir} = $dir;
+
+        if ($dir != $prev_dir) {
+            my $p = ($dir == 1) ? $st->{pivot_lo} : $st->{pivot_hi};
+            $p->{last}    = $p->{level};
+            $p->{level}   = ($dir == 1) ? $cand->{low} : $cand->{high};
+            $p->{crossed} = 0;
+            $p->{index}   = $i - $size;
         }
     }
 
-    # === CONDICION BAJISTA: close por debajo de un nivel estructural ===
+    return if $i < 1;
+    my $prev_close = $c->[$i-1]{close};
+    my $cur_close  = $c->[$i]{close};
+
+    # Cruce alcista: close cruza por ENCIMA del ultimo pivote alto no cruzado.
+    my $ph = $st->{pivot_hi};
+    if (defined $ph->{level} && !$ph->{crossed}
+        && $prev_close <= $ph->{level} && $cur_close > $ph->{level})
     {
-        my ($ref, $type);
+        my $type = (defined $st->{trend} && $st->{trend} eq 'bear') ? 'CHoCH' : 'BOS';
+        $ph->{crossed} = 1;
+        $st->{trend}   = 'bull';
+        $self->_emit($type, 'up', $i, $ph->{level}, $ph->{index}, $scope);
+    }
 
-        if (defined $bias && $bias eq 'bull') {
-            # CHoCH bear: rompemos el ultimo HL
-            $ref  = $self->{_last_hl};
-            $type = 'CHoCH';
-        } elsif (!defined $bias || $bias eq 'bear') {
-            # BOS bear: rompemos el ultimo LL (requiere nuevo SH previo)
-            $ref  = $self->{_last_ll};
-            $type = 'BOS';
-        }
-
-        if ($ref && $ref->{index} != $self->{_bl_idx}
-            && $cur->{close} < $ref->{price}
-            && (!defined $bias || $self->{_new_sh_since_last_down}))
-        {
-            $self->_emit($type, 'down', $i, $ref->{price}, $ref->{index});
-            $self->{_bias}   = 'bear';
-            $self->{_bl_idx} = $ref->{index};
-            $self->{_new_sh_since_last_down} = 0;
-        }
+    # Cruce bajista: close cruza por DEBAJO del ultimo pivote bajo no cruzado.
+    my $pl = $st->{pivot_lo};
+    if (defined $pl->{level} && !$pl->{crossed}
+        && $prev_close >= $pl->{level} && $cur_close < $pl->{level})
+    {
+        my $type = (defined $st->{trend} && $st->{trend} eq 'bull') ? 'CHoCH' : 'BOS';
+        $pl->{crossed} = 1;
+        $st->{trend}   = 'bear';
+        $self->_emit($type, 'down', $i, $pl->{level}, $pl->{index}, $scope);
     }
 }
 
+# _emit: registra el evento BOS/CHoCH. $scope distingue interno ('internal')
+# de externo ('external'); ambos comparten texto de etiqueta ("BOS"/"CHoCH") y
+# color (solo por direccion), el scope solo cambia el ESTILO de linea/chip
+# -- ver Overlays::SMC_Structures::_render_events (punteada+chico=interno,
+# solida+normal=externo, igual convencion que ZigZag interno/externo).
+# El Order Block solo se busca para eventos INTERNOS (comportamiento previo);
+# el scope externo marca estructura mayor pero no genera OB propio.
 sub _emit {
-    my ($self, $type, $dir, $i, $price, $origin) = @_;
+    my ($self, $type, $dir, $i, $price, $origin, $scope) = @_;
+    $scope //= 'internal';
+
     push @{ $self->{_events} }, {
         type   => $type,
         dir    => $dir,
@@ -548,7 +393,10 @@ sub _emit {
         ts     => $self->{_c}[$i]{ts},
         price  => $price,
         label  => $type,
+        scope  => $scope,
     };
+
+    return unless $scope eq 'internal';
 
     # Order Block: ultimo cuerpo contra-tendencia entre origin e i-1
     my $ob_dir   = ($dir eq 'up') ? 'bull' : 'bear';

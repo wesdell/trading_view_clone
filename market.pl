@@ -165,9 +165,9 @@ my $ind_manager = Market::IndicatorManager->new;
 
 # El ORDEN de registro importa: en cada vela, rebuild/update procesa los
 # indicadores en este orden. Liquidity necesita el ATR ya calculado (tolerancia
-# EQH/EQL) y SMC_Structures usa Liquidity como fuente de HH/HL/LH/LL. ZigZag
-# (interno/externo) es un overlay independiente, activado por su propio
-# checkbox, sin relacion con HH/HL/LH/LL/BOS/CHOCH.
+# EQH/EQL). ZigZag debe procesarse ANTES que SMC_Structures: las etiquetas
+# HH/HL/LH/LL de SMC_Structures espejan los pivotes del ZigZag INTERNO
+# (verde/rojo) de este mismo tick (ver Indicators::SMC_Structures::_sync_from_zigzag).
 my $atr_ind = Market::Indicators::ATR->new(14);
 my $liq_ind = Market::Indicators::Liquidity->new( atr => $atr_ind, k => 3 );
 
@@ -179,20 +179,7 @@ my $zz_ind = Market::Indicators::ZigZag->new(
     ext_length  => 150,     # ZigZag Volume Profile Length=150
 );
 my $smc_ind = Market::Indicators::SMC_Structures->new(
-    liquidity => $liq_ind, atr => $atr_ind, max_age => 50,
-    # structure_atr_factor: umbral (en ATR) para que un pivote entre en la
-    # linea estructural mayor. Mas alto = linea mas limpia (menos picos
-    # internos). Rango util aprox 1.5 (mas detalle) .. 3.5 (solo tramos
-    # grandes). Ajustar aqui si el profesor quiere mas/menos estructura.
-    struct_atr_mult => 2.5,
-    # Zigzag EXTERNO (azul, estructura mayor) -- algoritmo de TradingView
-    # (ZZMTF © LonesomeTheBlue / ZigZag Volume Profile © ChartPrime). main_prd =
-    # "period"/"swingLength": la vela es pivote si su high/low es el mayor/menor
-    # de las ultimas main_prd VELAS. Mas alto = menos pivotes (menos ruido); mas
-    # bajo = mas detalle. Es conteo de velas: en temporalidades bajas (1m/5m/15m/
-    # 1h) hace falta un valor alto para que no sea ruidoso. 50 da una linea de
-    # estructura mayor limpia en esas temporalidades (bajarlo mete mucho ruido).
-    main_prd => 50 );
+    zigzag => $zz_ind, atr => $atr_ind, max_age => 50 );
 
 $ind_manager->register('atr',       $atr_ind);
 $ind_manager->register('liquidity', $liq_ind);

@@ -5,9 +5,14 @@ package Market::Overlays::SMC_Structures;
 #
 # Renderiza todo lo calculado por Indicators/SMC_Structures.pm:
 #   - HH/HL/LH/LL: etiquetas sobre/bajo cada swing + linea zigzag
-#   - BOS / CHoCH: linea horizontal + chip de color
-#       BOS  bull  = verde teal  | BOS  bear  = rojo
-#       CHoCH bull = azul        | CHoCH bear = naranja  (colores distintos)
+#   - BOS / CHoCH: linea horizontal + chip de color (esquema LuxAlgo SMC:
+#       alcista = verde, bajista = rojo -- BOS y CHoCH comparten color, solo
+#       cambia el TEXTO del chip). Interno (ZigZag verde/rojo) vs externo
+#       (ZigZag azul, estructura mayor) se detectan por separado
+#       (Indicators::SMC_Structures::_detect_bos_choch) y se diferencian por
+#       ESTILO de linea/etiqueta, no por color:
+#         Interno  -> linea PUNTEADA, etiqueta chica (tiny)
+#         Externo  -> linea SOLIDA,   etiqueta normal
 #   - FVG: caja que empieza DESPUES de la 3a vela, solo los 'significant',
 #           con desvanecimiento progresivo por edad y consumo parcial
 #   - Order Blocks: cajas de demand/supply, solo cuando el precio esta
@@ -27,18 +32,10 @@ use constant TAG_FVG => 'smc_fvg_zone';
 use constant TAG_OB  => 'smc_ob_zone';
 
 use constant {
-    C_BOS_UP    => '#26a69a',   # BOS alcista   (verde teal)
-    C_BOS_DN    => '#ef5350',   # BOS bajista   (rojo)
-    C_CHOCH_UP  => '#2962ff',   # CHoCH alcista (azul)
-    C_CHOCH_DN  => '#ff6d00',   # CHoCH bajista (naranja)
+    C_BULL      => '#089981',   # BOS/CHoCH alcista (verde, esquema LuxAlgo)
+    C_BEAR      => '#f23645',   # BOS/CHoCH bajista (rojo,  esquema LuxAlgo)
     C_HH_HL     => '#26a69a',   # HH/HL labels  (alcista = verde)
     C_LH_LL     => '#ef5350',   # LH/LL labels  (bajista = rojo)
-    C_ZIGZAG    => '#546e7a',   # linea zigzag  (gris azulado, legacy)
-    # PDF "direccion interna/externa": zigzag INTERNO (fino) verde=subida /
-    # rojo=bajada; zigzag EXTERNO (estructura mayor compactada) en azul.
-    C_ZZ_INT_UP => '#26a69a',   # zigzag interno: pierna alcista (verde)
-    C_ZZ_INT_DN => '#ef5350',   # zigzag interno: pierna bajista (rojo)
-    C_ZZ_EXT    => '#2962ff',   # zigzag externo / estructura mayor (azul)
     C_OB_BULL   => '#81c784',   # OB alcista (demand)
     C_OB_BEAR   => '#e57373',   # OB bajista (supply)
 };
@@ -96,7 +93,14 @@ sub _label {
 }
 
 # =============================================================================
-# HH / HL / LH / LL  +  zigzag
+# HH / HL / LH / LL
+#
+# Solo las etiquetas (y el punto de pivote): el trazo del zigzag interno
+# (verde/rojo) y externo (azul) se dibuja aparte, en Overlays::ZigZag, y se
+# activa/desactiva desde su propio checkbox "ZigZag" -- no desde "Estructura
+# (HH/HL/LH/LL)". Los pivotes en si vienen espejados 1:1 del zigzag interno
+# (ver Indicators::SMC_Structures::_sync_from_zigzag), asi que ambos overlays
+# muestran exactamente los mismos vertices.
 # =============================================================================
 sub _render_struct {
     my ($self, $canvas, $scale, $src, $placer) = @_;
@@ -106,42 +110,6 @@ sub _render_struct {
     my $off    = $scale->{offset};
     my $vb     = $scale->{visible_bars};
     my $plot_w = $scale->_plot_w;   # borde derecho del area de grafico (regleta a la derecha)
-
-    # --- DOS zigzags de direccion (spec PDF "direccion interna/externa") ---
-    # Se incluye el pivote ANTERIOR y POSTERIOR a la ventana para que las
-    # piernas que la cruzan se dibujen completas. Todo se recorta a [0, plot_w]
-    # para no invadir la regleta de precios.
-    my ($lo, $hi) = ($off - 1, $off + $vb + 1);
-
-    # 1) Zigzag INTERNO (direccion interna): usa TODOS los pivotes estructurales
-    #    finos (get_struct_swings) y colorea cada segmento segun su direccion:
-    #    verde = pierna alcista (hacia un High), rojo = pierna bajista.
-    my @iv = _visible_pivots($swings, $lo, $hi);
-    for my $s (1 .. $#iv) {
-        my $a = $iv[$s-1]; my $b = $iv[$s];
-        my $up    = ($b->{kind} eq 'H');   # llega a un High -> pierna alcista
-        my $color = $up ? C_ZZ_INT_UP : C_ZZ_INT_DN;
-        $self->_seg_clipped($canvas, $scale, $a, $b, 0, $plot_w, $color, 1);
-    }
-
-    # 2) Zigzag EXTERNO (direccion externa = ESTRUCTURA MAYOR compactada):
-    #    une directamente origen->extremo de cada tramo fuerte (LL->HH directo)
-    #    y se pinta en AZUL, mas grueso, por encima del interno. Las etiquetas
-    #    HH/HL/LH/LL de abajo siguen sobre los pivotes crudos (no se pierde detalle).
-    my $main = $src->can('get_main_struct') ? $src->get_main_struct : $swings;
-    my @ev = _visible_pivots($main, $lo, $hi);
-    my @pts;
-    for my $p (@ev) {
-        push @pts, $scale->index_to_center_x($p->{index}),
-                   $scale->value_to_y_raw($p->{price});
-    }
-    @pts = _clip_polyline_x(\@pts, 0, $plot_w);
-    if (@pts >= 4) {
-        $canvas->createLine(@pts,
-            -fill  => C_ZZ_EXT,
-            -width => 2,
-            -tags  => [TAG]);
-    }
 
     # --- Etiquetas HH / HL / LH / LL ---
     # El punto (circulo) siempre se dibuja para marcar el vertice del zigzag,
@@ -341,9 +309,12 @@ sub _render_obs {
 
 # =============================================================================
 # BOS / CHoCH: linea horizontal del pivote al punto de ruptura + chip.
-# Colores distintos por tipo Y direction:
-#   BOS  up   = teal   | BOS  down  = rojo
-#   CHoCH up  = azul   | CHoCH down = naranja
+# Esquema LuxAlgo SMC: el color es SOLO por direccion (alcista=verde,
+# bajista=rojo); BOS y CHoCH comparten color, se distinguen por el texto del
+# chip. Interno vs externo se distingue por ESTILO, no por color:
+#   Interno (ZigZag verde/rojo, scope='internal') -> linea PUNTEADA, chip chico
+#   Externo (ZigZag azul, estructura mayor, scope='external') -> linea SOLIDA,
+#           chip normal
 # =============================================================================
 sub _render_events {
     my ($self, $canvas, $scale, $src, $placer) = @_;
@@ -363,12 +334,8 @@ sub _render_events {
         next if $e->{index} < $off || $e->{index} > $off + $vb;
         next unless $scale->value_in_range($e->{price});
 
-        my $color;
-        if ($is_choch) {
-            $color = ($e->{dir} eq 'up') ? C_CHOCH_UP : C_CHOCH_DN;
-        } else {
-            $color = ($e->{dir} eq 'up') ? C_BOS_UP   : C_BOS_DN;
-        }
+        my $color  = ($e->{dir} eq 'up') ? C_BULL : C_BEAR;
+        my $is_ext = (($e->{scope} // 'internal') eq 'external');
 
         my $oi = defined($e->{origin}) ? $e->{origin} : $e->{index} - 6;
         my $x1 = $scale->index_to_center_x($oi);
@@ -382,7 +349,7 @@ sub _render_events {
         $canvas->createLine($x1, $y, $x2, $y,
             -fill  => $color,
             -width => 1,
-            ($is_choch ? (-dash => [5, 3]) : ()),
+            ($is_ext ? () : (-dash => [4, 3])),
             -tags  => [TAG]);
 
         my $up = ($e->{dir} eq 'up');
@@ -390,7 +357,7 @@ sub _render_events {
             color => $color, style => 'solid',
             side  => ($up ? 'above' : 'below'),
             priority => 2, hideable => 0,
-            font => 'TkDefaultFont 8 bold');
+            font => ($is_ext ? 'TkDefaultFont 8 bold' : 'TkDefaultFont 6 bold'));
     }
 }
 
@@ -449,84 +416,6 @@ sub _box_hits {
         return 1;
     }
     return 0;
-}
-
-# -----------------------------------------------------------------------------
-# _visible_pivots: pivotes de $list dentro de [lo,hi] MAS un pivote bracketing
-# a cada lado (el ultimo antes de lo y el primero despues de hi), para que las
-# piernas que cruzan la ventana se dibujen completas.
-# -----------------------------------------------------------------------------
-sub _visible_pivots {
-    my ($list, $lo, $hi) = @_;
-    my @out;
-    my $prev;
-    for my $sw (@$list) {
-        if ($sw->{index} < $lo) { $prev = $sw; next; }
-        if (defined $prev) { push @out, $prev; $prev = undef; }
-        push @out, $sw;
-        last if $sw->{index} > $hi;   # ya incluido el primero > hi
-    }
-    return @out;
-}
-
-# -----------------------------------------------------------------------------
-# _seg_clipped: dibuja el segmento pivote $a -> $b (X creciente) recortado a
-# [xmin,xmax], interpolando la Y en los bordes (no invade la regleta).
-# -----------------------------------------------------------------------------
-sub _seg_clipped {
-    my ($self, $canvas, $scale, $a, $b, $xmin, $xmax, $color, $width) = @_;
-    my $x1 = $scale->index_to_center_x($a->{index});
-    my $y1 = $scale->value_to_y_raw($a->{price});
-    my $x2 = $scale->index_to_center_x($b->{index});
-    my $y2 = $scale->value_to_y_raw($b->{price});
-    return if $x2 < $xmin || $x1 > $xmax;   # totalmente fuera del area
-    if ($x2 > $xmax && $x2 != $x1) { my $t = ($xmax-$x1)/($x2-$x1); $x2 = $xmax; $y2 = $y1 + $t*($y2-$y1); }
-    if ($x1 < $xmin && $x1 != $x2) { my $t = ($xmin-$x2)/($x1-$x2); $x1 = $xmin; $y1 = $y2 + $t*($y1-$y2); }
-    $canvas->createLine($x1, $y1, $x2, $y2,
-        -fill => $color, -width => ($width // 1), -tags => [TAG]);
-}
-
-# -----------------------------------------------------------------------------
-# _clip_polyline_x: recorta una polilinea (@pts = x0,y0,x1,y1,...) al rango
-# horizontal [xmin, xmax], interpolando la Y en los cruces de borde. Los
-# pivotes vienen en X estrictamente creciente (orden por indice), asi que solo
-# hay UN cruce de entrada (izq) y UNO de salida (der). Evita que la linea se
-# meta en la regleta de precios (a la derecha de xmax = _plot_w).
-# -----------------------------------------------------------------------------
-sub _clip_polyline_x {
-    my ($pts, $xmin, $xmax) = @_;
-    my $n = int(@$pts / 2);
-    return () if $n < 2;
-
-    my @out;
-    for (my $i = 0; $i < $n; $i++) {
-        my ($x, $y) = ($pts->[2*$i], $pts->[2*$i+1]);
-
-        if ($x < $xmin) {
-            # cruce de entrada por la izquierda: interpolar en xmin con el siguiente
-            if ($i + 1 < $n) {
-                my ($nx, $ny) = ($pts->[2*$i+2], $pts->[2*$i+3]);
-                if ($nx > $x && $nx >= $xmin) {
-                    my $t = ($xmin - $x) / ($nx - $x);
-                    push @out, $xmin, $y + $t * ($ny - $y);
-                }
-            }
-            next;
-        }
-        if ($x > $xmax) {
-            # cruce de salida por la derecha: interpolar en xmax con el anterior
-            if ($i > 0) {
-                my ($px, $py) = ($pts->[2*$i-2], $pts->[2*$i-1]);
-                if ($px < $x && $px <= $xmax) {
-                    my $t = ($xmax - $px) / ($x - $px);
-                    push @out, $xmax, $py + $t * ($y - $py);
-                }
-            }
-            last;   # X monotona creciente: ya no hay mas puntos dentro del rango
-        }
-        push @out, $x, $y;
-    }
-    return @out;
 }
 
 # Mezcla hex con fondo blanco segun opacidad
