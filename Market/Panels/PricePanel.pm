@@ -113,7 +113,8 @@ sub render {
 
     $scale->_draw_y_scale($canvas);
 
-    my $bar_w  = $scale->_plot_w / $scale->{visible_bars};
+    my $plot_w = $scale->_plot_w;
+    my $bar_w  = $plot_w / $scale->{visible_bars};
     my $body_w = $bar_w * 0.65;
     $body_w = 1 if $body_w < 1;
     my $thin = ( $bar_w < 3 ) ? 1 : 0;
@@ -135,6 +136,18 @@ sub render {
         next if ( $c->{low} > $scale->{max_val} );
         next if ( $c->{high} < $scale->{min_val} );
 
+        # Recorte horizontal: el slice incluye una vela extra a la derecha
+        # (islice_end = floor(end)+1) y el offset es fraccionario, por lo que
+        # la ultima vela puede caer sobre la regleta de precios. Se omite la
+        # que quede totalmente fuera y se recortan los bordes del cuerpo de la
+        # parcial para que no invada la escala (igual criterio que overlays).
+        my $bx1 = $cx - $body_w / 2;
+        my $bx2 = $cx + $body_w / 2;
+        next if $bx1 > $plot_w;   # totalmente dentro de la regleta
+        next if $bx2 < 0;         # totalmente fuera por la izquierda
+        $bx1 = 0       if $bx1 < 0;
+        $bx2 = $plot_w if $bx2 > $plot_w;
+
         my $y_open  = $scale->value_to_y( $c->{open} );
         my $y_high  = $scale->value_to_y( $c->{high} );
         my $y_low   = $scale->value_to_y( $c->{low} );
@@ -150,24 +163,28 @@ sub render {
         $body_h = MIN_BODY_H if $body_h < MIN_BODY_H;
 
         $canvas->createRectangle(
-            $cx - $body_w / 2, $y_top,
-            $cx + $body_w / 2, $y_top + $body_h,
+            $bx1, $y_top,
+            $bx2, $y_top + $body_h,
             -fill    => $color,
             -outline => $border,
             -tags    => ['candle'],
         );
 
-        $canvas->createLine(
-            $cx, $y_high, $cx, $y_top,
-            -fill => $color,
-            -tags => ['candle']
-        );
+        # La mecha es vertical (en $cx): solo se dibuja si su centro cae
+        # dentro del area de grafico, para no pintarla sobre la regleta.
+        if ( $cx >= 0 && $cx <= $plot_w ) {
+            $canvas->createLine(
+                $cx, $y_high, $cx, $y_top,
+                -fill => $color,
+                -tags => ['candle']
+            );
 
-        $canvas->createLine(
-            $cx, $y_top + $body_h, $cx, $y_low,
-            -fill => $color,
-            -tags => ['candle']
-        );
+            $canvas->createLine(
+                $cx, $y_top + $body_h, $cx, $y_low,
+                -fill => $color,
+                -tags => ['candle']
+            );
+        }
     }
 }
 

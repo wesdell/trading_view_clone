@@ -132,6 +132,13 @@ sub _render_zz {
         my $x2 = $scale->index_to_center_x($ib);
         my $y2 = $scale->value_to_y($b->{price});
 
+        # Recorte horizontal al area de grafico: un extremo puede caer a la
+        # derecha de la ventana visible y su X quedaria sobre la regleta de
+        # precios. clip_line_x acorta el trazo hasta el borde exacto sin
+        # alterar la pendiente (devuelve () si el segmento queda fuera).
+        ( $x1, $y1, $x2, $y2 ) = $scale->clip_line_x( $x1, $y1, $x2, $y2 );
+        next unless defined $x1;
+
         my $color;
         if ($is_ext) {
             $color = C_EXT;

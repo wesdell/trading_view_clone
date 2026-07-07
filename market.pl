@@ -93,16 +93,19 @@ my $canvas_atr = $mw->Canvas(
 # =============================================================================
 my $market = Market::MarketData->new;
 
-# Los tres archivos del proyecto en orden cronologico.
+# Los archivos del proyecto en orden cronologico (Abr, May, Jun, Jul).
 # 2026_03.csv es un archivo con nombre incorrecto que contiene datos de Abril;
 # se usa como fallback de 2026_04.csv si este no existe (son identicos).
+# 2026_06.csv (mes de Junio completo) reemplaza al antiguo 2026_06_29.csv
+# (que solo llegaba al 29/06). 2026_07_06.csv agrega Julio hasta el 06/07.
 # Se salta cualquier vela con timestamp <= al ultimo ya cargado para evitar
 # duplicados en caso de que los archivos se solapen.
 my @csv_groups = (
     ['data/2026_04.csv', '2026_04.csv', '../data/2026_04.csv',
      'data/2026_03.csv', '2026_03.csv', '../data/2026_03.csv'],
     ['data/2026_05.csv', '2026_05.csv', '../data/2026_05.csv'],
-    ['data/2026_06_29.csv', '2026_06_29.csv', '../data/2026_06_29.csv'],
+    ['data/2026_06.csv', '2026_06.csv', '../data/2026_06.csv'],
+    ['data/2026_07_06.csv', '2026_07_06.csv', '../data/2026_07_06.csv'],
 );
 
 my $count    = 0;

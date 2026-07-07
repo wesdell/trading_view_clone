@@ -177,6 +177,13 @@ sub _render_equals {
         my $y1 = $scale->value_to_y( $e->{p1} );
         my $y2 = $scale->value_to_y( $e->{p2} );
 
+        # Recorte horizontal: i2 puede caer a la derecha de la ventana y la
+        # linea de EQH/EQL invadiria la regleta de precios. Se acorta al borde
+        # (mismo criterio que ZigZag) y el chip se ubica sobre el trazo ya
+        # recortado para que tampoco quede sobre la escala.
+        ( $x1, $y1, $x2, $y2 ) = $scale->clip_line_x( $x1, $y1, $x2, $y2 );
+        next unless defined $x1;
+
         $canvas->createLine( $x1, $y1, $x2, $y2,
             -fill => C_EQ, -width => 1, -dash => [ 4, 2 ], -tags => [TAG] );
 

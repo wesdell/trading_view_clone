@@ -67,6 +67,48 @@ sub index_to_center_x {
     return ( ( $idx - $self->{offset} ) * $bar_w ) + ( $bar_w / 2 );
 }
 
+# -----------------------------------------------------------------------------
+# clip_line_x: recorta el segmento (x1,y1)-(x2,y2) al rango horizontal del
+# area de grafico [0, _plot_w], interpolando Y en el punto de corte para
+# PRESERVAR la pendiente. Sirve para que los overlays de linea (zigzag,
+# estructura) no invadan la regleta de precios de la derecha ni el borde
+# izquierdo: en lugar de recortar el canvas se acorta el propio trazo hasta
+# el borde exacto, igual que hace TradingView con las lineas parcialmente
+# visibles.
+#
+# Devuelve (x1,y1,x2,y2) recortados, o lista vacia () si el segmento cae
+# por completo fuera del area horizontal.
+# -----------------------------------------------------------------------------
+sub clip_line_x {
+    my ( $self, $x1, $y1, $x2, $y2 ) = @_;
+    my $x_min = 0;
+    my $x_max = $self->_plot_w;
+
+    # Ambos extremos al mismo lado fuera del area -> nada que dibujar.
+    return () if $x1 < $x_min && $x2 < $x_min;
+    return () if $x1 > $x_max && $x2 > $x_max;
+
+    my $dx = $x2 - $x1;
+
+    # Segmento vertical: no cruza los bordes en X; basta comprobar el rango.
+    if ( $dx == 0 ) {
+        return () if $x1 < $x_min || $x1 > $x_max;
+        return ( $x1, $y1, $x2, $y2 );
+    }
+
+    my $slope = ( $y2 - $y1 ) / $dx;
+
+    # Borde izquierdo (x_min).
+    if ( $x1 < $x_min ) { $y1 += $slope * ( $x_min - $x1 ); $x1 = $x_min; }
+    if ( $x2 < $x_min ) { $y2 += $slope * ( $x_min - $x2 ); $x2 = $x_min; }
+
+    # Borde derecho (x_max = inicio de la regleta de precios).
+    if ( $x1 > $x_max ) { $y1 += $slope * ( $x_max - $x1 ); $x1 = $x_max; }
+    if ( $x2 > $x_max ) { $y2 += $slope * ( $x_max - $x2 ); $x2 = $x_max; }
+
+    return ( $x1, $y1, $x2, $y2 );
+}
+
 sub value_to_y {
     my ( $self, $value ) = @_;
     my $range = $self->{max_val} - $self->{min_val};
