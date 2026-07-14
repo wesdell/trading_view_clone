@@ -93,23 +93,43 @@ my $canvas_atr = $mw->Canvas(
 # =============================================================================
 my $market = Market::MarketData->new;
 
-# Los archivos del proyecto en orden cronologico (Abr, May, Jun, Jul).
+# Los archivos del proyecto en orden cronologico.
 # 2026_03.csv es un archivo con nombre incorrecto que contiene datos de Abril;
 # se usa como fallback de 2026_04.csv si este no existe (son identicos).
-# 2026_06.csv (mes de Junio completo) reemplaza al antiguo 2026_06_29.csv
-# (que solo llegaba al 29/06). 2026_07_06.csv agrega Julio hasta el 06/07.
 # Se salta cualquier vela con timestamp <= al ultimo ya cargado para evitar
 # duplicados en caso de que los archivos se solapen.
 my @csv_groups = (
     ['data/2026_04.csv', '2026_04.csv', '../data/2026_04.csv',
      'data/2026_03.csv', '2026_03.csv', '../data/2026_03.csv'],
     ['data/2026_05.csv', '2026_05.csv', '../data/2026_05.csv'],
-    ['data/2026_06.csv', '2026_06.csv', '../data/2026_06.csv'],
-    ['data/2026_07_06.csv', '2026_07_06.csv', '../data/2026_07_06.csv'],
+    ['data/2026_06_29.csv', '2026_06_29.csv', '../data/2026_06_29.csv'],
+    # Cuarto grupo (entrega 2): continua la serie desde donde termina
+    # 2026_06_29.csv. Si hay velas solapadas entre ambos archivos (este
+    # arranca el 2026-07-01), el guard $last_ts de mas abajo las descarta
+    # automaticamente -- mismo mecanismo que ya filtra el duplicado
+    # 2026_03.csv/2026_04.csv, no requiere logica nueva.
+    ['data/2026_07_13.csv', '2026_07_13.csv', '../data/2026_07_13.csv'],
 );
 
-my $count    = 0;
-my $last_ts  = 0;
+# -----------------------------------------------------------------------------
+# FIX (entrega 2): dedup por TIMESTAMP EXACTO via hash, no por "monotono
+# creciente" via un simple $last_ts. Con el guard anterior (next if $ts <=
+# $last_ts) el archivo mas VIEJO en @csv_groups ganaba cualquier solape --
+# como 2026_06_29.csv se carga ANTES que 2026_07_13.csv, si el primero ya
+# traia datos parciales/preliminares de julio, esos quedaban visibles y las
+# velas correctas del archivo nuevo para esas mismas fechas se descartaban
+# en silencio. Efecto observado: todas las temporalidades intradia
+# (5m/15m/30m/1h/2h/4h/D) mostraban julio mal, mientras que W se veia bien
+# porque una vela semanal diluye el error entre miles de velas de 1m.
+#
+# Ahora se indexa cada vela por su epoch en %by_ts recorriendo los grupos en
+# orden: si dos archivos traen la MISMA vela (mismo ts), el que se procesa
+# DESPUES (mas nuevo/mas autoritativo, por convencion de orden en
+# @csv_groups) sobre-escribe al anterior. Al final se ordena por ts y se
+# alimenta a MarketData -- el orden final de insercion es siempre
+# cronologico, igual que antes.
+# -----------------------------------------------------------------------------
+my %by_ts;
 
 for my $paths (@csv_groups) {
     my $csv_path;
@@ -133,9 +153,9 @@ for my $paths (@csv_groups) {
         eval { $tm = Time::Moment->from_string($time_str) };
         next if $@;
         my $ts = $tm->epoch;
-        next if $ts <= $last_ts;   # saltar duplicados / datos fuera de orden
-        $last_ts = $ts;
-        $market->add_candle({
+
+        # Sobre-escribe silenciosamente si ya existia (archivo mas nuevo gana).
+        $by_ts{$ts} = {
             time   => $time_str,
             ts     => $ts,
             open   => $open  + 0,
@@ -143,10 +163,15 @@ for my $paths (@csv_groups) {
             low    => $low   + 0,
             close  => $close + 0,
             volume => $volume + 0,
-        });
-        $count++;
+        };
     }
     close $fh;
+}
+
+my $count = 0;
+for my $ts (sort { $a <=> $b } keys %by_ts) {
+    $market->add_candle($by_ts{$ts});
+    $count++;
 }
 
 printf "Cargadas %d velas de 1m\n", $count;
