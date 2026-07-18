@@ -236,9 +236,15 @@ sub _render_fvgs {
         if (($yb - $yt) >= 14 && $age <= int($max_age * 0.6)) {
             my $cx = ($x1 + $x2) / 2;
             $cx = 24 if $cx < 24;
-            $self->_label($placer, $canvas, $cx, ($yt + $yb) / 2, 'FVG',
-                color => $base, style => 'outline', side => 'center',
-                priority => 7, hideable => 1,
+            # FASE-2.2: un FVG marcado como "Zona de Alta Reaccion" por confluir
+            # con un Sweep/Grab conserva su caja y desvanecimiento; solo cambia
+            # el chip (texto + color naranja) para senalar la clasificacion.
+            my ($txt, $col, $pri) = $f->{reaction_zone}
+                ? ('FVG - Zona Alta Reaccion', '#ff9800', 8)
+                : ('FVG', $base, 7);
+            $self->_label($placer, $canvas, $cx, ($yt + $yb) / 2, $txt,
+                color => $col, style => 'outline', side => 'center',
+                priority => $pri, hideable => 1,
                 font => 'TkDefaultFont 6 bold');
         }
     }

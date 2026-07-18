@@ -26,6 +26,12 @@ use Market::Overlays::SMC_Structures;
 use Market::Overlays::Liquidity;
 use Market::Indicators::ZigZag;
 use Market::Overlays::ZigZag;
+use Market::Indicators::Strategy_Builder;   # FASE-2.3: DIY Custom Strategy Builder
+use Market::Overlays::Strategy_Builder;
+use Market::Indicators::VolumeProfile;       # FASE-2.4: Perfil de Volumen avanzado
+use Market::Overlays::VolumeProfile;
+use Market::Indicators::AnchoredVWAP;         # FASE-2.5: Anchored VWAP multipivote
+use Market::Overlays::AnchoredVWAP;
 
 # =============================================================================
 # VENTANA
@@ -207,12 +213,40 @@ my $zz_ind = Market::Indicators::ZigZag->new(
     ext_length  => 150,     # ZigZag Volume Profile Length=150
 );
 my $smc_ind = Market::Indicators::SMC_Structures->new(
-    zigzag => $zz_ind, atr => $atr_ind, max_age => 50 );
+    zigzag => $zz_ind, atr => $atr_ind, max_age => 50,
+    liquidity => $liq_ind );   # FASE-2.2: SMC consume (no recalcula) los eventos de Liquidity
 
-$ind_manager->register('atr',       $atr_ind);
-$ind_manager->register('liquidity', $liq_ind);
-$ind_manager->register('zigzag',    $zz_ind);
-$ind_manager->register('smc',       $smc_ind);
+# FASE-2.3: Strategy Builder (5 componentes + combinador). Regla por defecto
+# operativa (combinable/seleccionable desde los checkboxes); componentes se
+# calculan siempre, independientes de la seleccion de reglas.
+my $sb_ind = Market::Indicators::Strategy_Builder->new(
+    rules => {
+        entry => { conds => ['st_flip_up',   'rf_up'],   mode => 'AND', side => 'long'  },
+        exit  => { conds => ['st_flip_down', 'ht_down'], mode => 'OR',  side => 'long'  },
+    },
+);
+
+# FASE-2.4: Perfil de Volumen (modo sesion por defecto; recibe SMC para el modo
+# BOS/CHoCH). Se registra DESPUES de SMC para consumir sus eventos confirmados.
+my $vp_ind = Market::Indicators::VolumeProfile->new(
+    mode => 'session', nbins => 50, va_pct => 0.70, smc => $smc_ind );
+
+# FASE-2.5: Anchored VWAP multipivote (consume BOS/CHoCH de SMC y POC de VP;
+# se registra DESPUES de ambos para leer sus salidas confirmadas de la vela i).
+my $vwap_ind = Market::Indicators::AnchoredVWAP->new(
+    smc => $smc_ind, vp => $vp_ind, anchor_scope => 'external' );
+
+# FASE-2.6 -- FLUJO OBLIGATORIO POR VELA. El orden de registro ES el orden de
+# actualizacion en rebuild_all/update_last (bars-outer x indicadores-inner). Las
+# dependencias son UNIDIRECCIONALES: cada consumidor se registra DESPUES de sus
+# productores. (Reordenar indicadores independientes NO cambia resultados.)
+$ind_manager->register('atr',       $atr_ind);   # (2) ATR base / temporalidades
+$ind_manager->register('zigzag',    $zz_ind);    # (3) estructura HH/HL (alimenta SMC)
+$ind_manager->register('liquidity', $liq_ind);   # (4,5,8) Liquidity + eventos + volumen multi-TF
+$ind_manager->register('smc',       $smc_ind);   # (6,7) BOS/CHoCH + FVG (lee zigzag + liquidity)
+$ind_manager->register('vp',        $vp_ind);    # (9) Volume Profile (lee eventos SMC)
+$ind_manager->register('vwap',      $vwap_ind);  # (10) Anchored VWAP (lee SMC + VP)
+$ind_manager->register('strategy',  $sb_ind);    # (11) Strategy Builder (independiente)
 
 print "Calculando indicadores (ATR, Liquidity, SMC)...\n";
 $ind_manager->rebuild_all($market);
@@ -237,6 +271,15 @@ $overlay_mgr->register('liquidity', $liq_overlay, visible => 0);
 
 my $zz_overlay = Market::Overlays::ZigZag->new( source => $zz_ind );
 $overlay_mgr->register('zigzag', $zz_overlay, visible => 0);
+
+my $sb_overlay = Market::Overlays::Strategy_Builder->new( source => $sb_ind );  # FASE-2.3
+$overlay_mgr->register('strategy', $sb_overlay, visible => 0);
+
+my $vp_overlay = Market::Overlays::VolumeProfile->new( source => $vp_ind );     # FASE-2.4
+$overlay_mgr->register('volumeprofile', $vp_overlay, visible => 0);
+
+my $vwap_overlay = Market::Overlays::AnchoredVWAP->new( source => $vwap_ind );  # FASE-2.5
+$overlay_mgr->register('avwap', $vwap_overlay, visible => 0);
 
 # =============================================================================
 # PANELES Y MOTOR
@@ -780,6 +823,84 @@ $make_chk->($col_zz, 'Activar ZigZag', \$zz_master, sub {
 });
 $make_chk->($col_zz, 'Interno (30m)',   \$ZZ{show_internal}, $leaf_zz);
 $make_chk->($col_zz, 'Externo (150)',   \$ZZ{show_external}, $leaf_zz);
+
+# =============================================================================
+# Columna STRATEGY BUILDER (SuperTrend / HalfTrend / Range Filter /
+# Supply / Demand / Senales). FASE-2.3. Mismos controles/patron existentes.
+# =============================================================================
+my %SB = (
+    show_supertrend => 0, show_halftrend => 0, show_rangefilter => 0,
+    show_supply => 0, show_demand => 0, show_signals => 0,
+);
+my $sb_master = 0;
+my $refresh_sb = sub {
+    $sb_overlay->set_flag($_, $SB{$_}) for keys %SB;
+    my $any = 0; $any ||= $SB{$_} for keys %SB;
+    $overlay_mgr->set_visible('strategy', $any ? 1 : 0);
+    $engine->request_render;
+};
+my $sync_sb_master = sub { my $all = 1; $all &&= $SB{$_} for keys %SB; $sb_master = $all ? 1 : 0; };
+my $leaf_sb = sub { $refresh_sb->(); $sync_sb_master->(); };
+
+my $col_sb = $make_col->('Strategy Builder', '#42a5f5');
+$make_chk->($col_sb, 'Activar Strategy', \$sb_master, sub {
+    $SB{$_} = $sb_master for keys %SB; $refresh_sb->();
+});
+$make_chk->($col_sb, 'SuperTrend',   \$SB{show_supertrend},  $leaf_sb);
+$make_chk->($col_sb, 'HalfTrend',    \$SB{show_halftrend},   $leaf_sb);
+$make_chk->($col_sb, 'Range Filter', \$SB{show_rangefilter}, $leaf_sb);
+$make_chk->($col_sb, 'Supply Zones', \$SB{show_supply},      $leaf_sb);
+$make_chk->($col_sb, 'Demand Zones', \$SB{show_demand},      $leaf_sb);
+$make_chk->($col_sb, 'Senales',      \$SB{show_signals},     $leaf_sb);
+
+# =============================================================================
+# Columna VOLUME PROFILE (POC / Value Area / Histograma / Ancla). FASE-2.4.
+# Modo sesion por defecto; POC/VAH/VAL a precio fijo (no cambian con zoom).
+# =============================================================================
+my %VP = ( show_poc => 0, show_va => 0, show_hist => 0, show_anchor => 0 );
+my $vp_master = 0;
+my $refresh_vp = sub {
+    $vp_overlay->set_flag($_, $VP{$_}) for keys %VP;
+    my $any = 0; $any ||= $VP{$_} for keys %VP;
+    $overlay_mgr->set_visible('volumeprofile', $any ? 1 : 0);
+    $engine->request_render;
+};
+my $sync_vp_master = sub { my $all = 1; $all &&= $VP{$_} for keys %VP; $vp_master = $all ? 1 : 0; };
+my $leaf_vp = sub { $refresh_vp->(); $sync_vp_master->(); };
+
+my $col_vp = $make_col->('Volume Profile', '#ff9800');
+$make_chk->($col_vp, 'Activar Volume Profile', \$vp_master, sub {
+    $VP{$_} = $vp_master for keys %VP; $refresh_vp->();
+});
+$make_chk->($col_vp, 'POC',        \$VP{show_poc},    $leaf_vp);
+$make_chk->($col_vp, 'Value Area (VAH/VAL)', \$VP{show_va}, $leaf_vp);
+$make_chk->($col_vp, 'Histograma', \$VP{show_hist},   $leaf_vp);
+$make_chk->($col_vp, 'Ancla',      \$VP{show_anchor}, $leaf_vp);
+
+# =============================================================================
+# Columna ANCHORED VWAP (5 anclas: Sesion / Apertura / BOS / CHoCH / POC).
+# FASE-2.5. Multipivote: varias anclas activas a la vez.
+# =============================================================================
+my %AV = ( show_session => 0, show_open => 0, show_bos => 0, show_choch => 0, show_poc => 0 );
+my $av_master = 0;
+my $refresh_av = sub {
+    $vwap_overlay->set_flag($_, $AV{$_}) for keys %AV;
+    my $any = 0; $any ||= $AV{$_} for keys %AV;
+    $overlay_mgr->set_visible('avwap', $any ? 1 : 0);
+    $engine->request_render;
+};
+my $sync_av_master = sub { my $all = 1; $all &&= $AV{$_} for keys %AV; $av_master = $all ? 1 : 0; };
+my $leaf_av = sub { $refresh_av->(); $sync_av_master->(); };
+
+my $col_av = $make_col->('Anchored VWAP', '#26a69a');
+$make_chk->($col_av, 'Activar VWAP', \$av_master, sub {
+    $AV{$_} = $av_master for keys %AV; $refresh_av->();
+});
+$make_chk->($col_av, 'Inicio sesion',   \$AV{show_session}, $leaf_av);
+$make_chk->($col_av, 'Apertura mercado', \$AV{show_open},   $leaf_av);
+$make_chk->($col_av, 'BOS',   \$AV{show_bos},   $leaf_av);
+$make_chk->($col_av, 'CHoCH', \$AV{show_choch}, $leaf_av);
+$make_chk->($col_av, 'POC',   \$AV{show_poc},   $leaf_av);
 
 # =============================================================================
 # PRIMER RENDER

@@ -3,11 +3,26 @@ package Market::Indicators::SMC_Structures;
 use strict;
 use warnings;
 
+# FASE-2.2: pesos de confluencia con eventos de Liquidity. El refuerzo es
+# ADITIVO sobre el peso base (1.0) y configurable; refleja el "incremento
+# drastico" de la spec 5 sin CREAR estructura (solo pondera la ya detectada).
+use constant {
+    LIQ_WEIGHT_BASE  => 1.0,   # peso base de todo BOS/CHoCH
+    LIQ_SWEEP_BOOST  => 1.0,   # Sweep contrario -> refuerza CHoCH
+    LIQ_RUN_BOOST    => 1.0,   # Run a favor    -> refuerza BOS
+    LIQ_REL_LOOKBACK => 20,    # ventana (velas) de vigencia de un evento de Liquidity
+};
+
 sub new {
     my ($class, %args) = @_;
     my $self = {
         zigzag             => $args{zigzag},
         atr                => $args{atr},
+        # Referencia de SOLO LECTURA al indicador Liquidity ya calculado (FASE
+        # 2.1). SMC NO recalcula Liquidity: consume get_events() via un cursor.
+        # En rebuild_all el orden de registro (liquidity antes que smc) garantiza
+        # que los eventos de la vela i ya existen cuando SMC procesa la vela i.
+        liquidity          => $args{liquidity},
         max_age            => $args{max_age}           // 50,
         min_fvg_atr_mult   => $args{min_fvg_atr_mult}  // 0.20,
         ob_proximity_mult  => $args{ob_proximity_mult}  // 6.0,
@@ -18,6 +33,11 @@ sub new {
         _events       => [],
         _order_blocks => [],
         _active_obs   => [],
+
+        # FASE-2.2: integracion Liquidity -> SMC (relaciones, paso 8 por vela).
+        _liq_seen         => 0,    # cursor: nº de eventos de Liquidity ya consumidos
+        _liq_recent       => [],   # eventos de Liquidity vigentes (ventana lookback)
+        _reversal_alerts  => [],   # alertas de reversion generadas por Grabs
 
         # Las etiquetas HH/HL/LH/LL se derivan 1:1 de los segmentos del ZigZag
         # INTERNO (verde/rojo) de Indicators::ZigZag -- esto NO se toca: el
@@ -64,11 +84,12 @@ sub _mk_leg_state {
     };
 }
 
-sub get_values        { return []; }
-sub get_fvgs          { return $_[0]->{_fvgs}; }
-sub get_events        { return $_[0]->{_events}; }
-sub get_struct_swings { return $_[0]->{_struct}{swings}; }
-sub get_order_blocks  { return $_[0]->{_order_blocks}; }
+sub get_values          { return []; }
+sub get_fvgs            { return $_[0]->{_fvgs}; }
+sub get_events          { return $_[0]->{_events}; }
+sub get_struct_swings   { return $_[0]->{_struct}{swings}; }
+sub get_order_blocks    { return $_[0]->{_order_blocks}; }
+sub get_reversal_alerts { return $_[0]->{_reversal_alerts}; }   # FASE-2.2 (Grabs)
 
 sub processed_last    { return $#{ $_[0]->{_c} }; }
 
@@ -80,6 +101,9 @@ sub reset {
     $self->{_events}       = [];
     $self->{_order_blocks} = [];
     $self->{_active_obs}   = [];
+    $self->{_liq_seen}        = 0;    # FASE-2.2: cursor y buffers de relaciones
+    $self->{_liq_recent}      = [];
+    $self->{_reversal_alerts} = [];
     $self->{_struct}       = _mk_struct_state();
     $self->{_bos} = {
         internal => _mk_leg_state( $self->{_bos}{internal}{size} ),
@@ -105,11 +129,12 @@ sub _process {
     my ($self, $c) = @_;
     push @{ $self->{_c} }, $c;
     my $i = $#{ $self->{_c} };
-    $self->_sync_from_zigzag;
-    $self->_detect_fvg($i);
+    $self->_sync_from_zigzag;          # (5) estructura HH/HL/LH/LL
+    $self->_detect_fvg($i);            # (7) FVG (no interactua con BOS/CHoCH)
     $self->_update_fvgs($i);
     $self->_update_obs($i);
-    $self->_detect_bos_choch($i);
+    $self->_detect_bos_choch($i);      # (6) BOS/CHoCH
+    $self->_apply_liquidity_relations($i);   # (8) relaciones Liquidity -> SMC
 }
 
 # -----------------------------------------------------------------------------
@@ -255,6 +280,11 @@ sub _detect_fvg {
         #  - bear: arranca en bottom y sube hacia top; restante = [consumed_to, top].
         consumed_to => ($dir eq 'bull' ? $top : $bottom),
         significant => (($top - $bottom) >= $min_sz),
+        # FASE-2.2: se completa en _apply_liquidity_relations si coincide con un
+        # Sweep/Grab. NO se duplica el FVG: es el MISMO objeto con clasificacion.
+        reaction_zone => 0,
+        liq_event_id  => undef,
+        liq_type      => undef,
     };
     push @{ $self->{_fvgs} }, $fvg;
     push @{ $self->{_active_fvgs} }, $fvg if $fvg->{significant};
@@ -394,6 +424,11 @@ sub _emit {
         price  => $price,
         label  => $type,
         scope  => $scope,
+        # FASE-2.2: peso de probabilidad (base 1.0); se refuerza en
+        # _apply_liquidity_relations si hay confluencia con Sweep/Run. La
+        # estructura NUNCA se crea por Liquidity, solo se pondera.
+        weight        => LIQ_WEIGHT_BASE,
+        liq_confluence => undef,
     };
 
     return unless $scope eq 'internal';
@@ -442,6 +477,102 @@ sub _update_obs {
         push @keep, $ob;
     }
     $self->{_active_obs} = \@keep;
+}
+
+# -----------------------------------------------------------------------------
+# _apply_liquidity_relations (FASE-2.2, paso 8) -- relaciones Liquidity -> SMC.
+# CONSUME (no recalcula) los eventos ya resueltos por Indicators::Liquidity via
+# un cursor monotono. Reglas de la spec 5:
+#   * Sweep  -> refuerza el peso de un CHoCH en direccion CONTRARIA al barrido
+#               (un Sweep de BSL, dir 'up', apoya un CHoCH 'down'). No crea CHoCH.
+#   * Run    -> refuerza el peso/continuidad de un BOS en la MISMA direccion.
+#               No crea BOS (solo pondera el ya detectado por pivote valido).
+#   * Grab   -> genera una ALERTA de reversion (dir contraria + tf del evento).
+#               No es entrada; conserva id/direccion/timeframe del evento.
+#   * FVG en la vela del Sweep/Grab (o inmediatamente posterior) -> "Zona de Alta
+#               Reaccion" con el id del evento, SIN duplicar el FVG.
+# Sin futuro: solo se consumen eventos con confirmed_ts <= ts de la vela actual;
+# el orden de registro (liquidity antes que smc) los deja listos para la vela i.
+# -----------------------------------------------------------------------------
+sub _apply_liquidity_relations {
+    my ($self, $i) = @_;
+    my $liq = $self->{liquidity} or return;   # SMC funciona igual sin Liquidity
+    my $c   = $self->{_c};
+    my $ts  = $c->[$i]{ts};
+
+    # (a) avanzar el cursor: consumir eventos de Liquidity ya confirmados.
+    my $levents = $liq->get_events;
+    while ( $self->{_liq_seen} < scalar(@$levents) ) {
+        my $e = $levents->[ $self->{_liq_seen} ];
+        last if $e->{confirmed_ts} > $ts;     # aun no confirmado a esta altura (sin futuro)
+        $self->{_liq_seen}++;
+        push @{ $self->{_liq_recent} }, $e;
+
+        # (c) Grab -> alerta de reversion (NO entrada). Conserva dir y tf.
+        if ( $e->{type} eq 'GRAB' ) {
+            push @{ $self->{_reversal_alerts} }, {
+                dir          => ( $e->{dir} eq 'up' ? 'down' : 'up' ),
+                tf           => $e->{origin_tf},
+                ts           => $e->{confirmed_ts},
+                index        => $i,
+                price        => $e->{price},
+                liq_event_id => $e->{level_id},
+                source       => 'GRAB',
+            };
+        }
+    }
+
+    # podar el buffer de eventos vigentes a la ventana lookback
+    my $lo_i  = $i - LIQ_REL_LOOKBACK; $lo_i = 0 if $lo_i < 0;
+    my $lo_ts = $c->[$lo_i]{ts};
+    @{ $self->{_liq_recent} } = grep { $_->{confirmed_ts} >= $lo_ts } @{ $self->{_liq_recent} };
+
+    # (b) reforzar el peso de los BOS/CHoCH emitidos EN ESTA vela (index == i).
+    for ( my $k = $#{ $self->{_events} }; $k >= 0; $k-- ) {
+        my $ev = $self->{_events}[$k];
+        last if $ev->{index} != $i;             # los de esta vela estan al final
+        next if defined $ev->{liq_confluence};
+        if ( $ev->{type} eq 'CHoCH' ) {
+            my $want = ( $ev->{dir} eq 'up' ) ? 'down' : 'up';   # Sweep CONTRARIO
+            my $s = $self->_recent_liq( 'SWEEP', $want );
+            if ($s) {
+                $ev->{weight} += LIQ_SWEEP_BOOST;
+                $ev->{liq_confluence} = { type=>'SWEEP', event_id=>$s->{level_id}, dir=>$s->{dir} };
+            }
+        }
+        elsif ( $ev->{type} eq 'BOS' ) {
+            my $r = $self->_recent_liq( 'RUN', $ev->{dir} );      # Run a FAVOR
+            if ($r) {
+                $ev->{weight} += LIQ_RUN_BOOST;
+                $ev->{liq_confluence} = { type=>'RUN', event_id=>$r->{level_id}, dir=>$r->{dir} };
+            }
+        }
+    }
+
+    # (d) FVG creado en esta vela: "Zona de Alta Reaccion" si un Sweep/Grab rompio
+    #     en una de sus velas (i-2..i) o inmediatamente antes (i-3). Sin duplicar.
+    my $f = $self->{_fvgs}[-1];
+    if ( $f && $f->{idx_create} == $i && !$f->{reaction_zone} ) {
+        my %span = map { $c->[$_]{ts} => 1 } grep { $_ >= 0 } ( $i - 3 .. $i );
+        for my $e ( reverse @{ $self->{_liq_recent} } ) {
+            next unless $e->{type} eq 'SWEEP' || $e->{type} eq 'GRAB';
+            if ( $span{ $e->{break_ts} } ) {
+                $f->{reaction_zone} = 1;
+                $f->{liq_event_id}  = $e->{level_id};
+                $f->{liq_type}      = $e->{type};
+                last;
+            }
+        }
+    }
+}
+
+# _recent_liq: evento de Liquidity vigente mas reciente del tipo y direccion dados.
+sub _recent_liq {
+    my ($self, $type, $dir) = @_;
+    for my $e ( reverse @{ $self->{_liq_recent} } ) {
+        return $e if $e->{type} eq $type && $e->{dir} eq $dir;
+    }
+    return undef;
 }
 
 sub _max { $_[0] > $_[1] ? $_[0] : $_[1] }

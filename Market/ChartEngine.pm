@@ -433,6 +433,9 @@ sub render {
     if (@candle_ids) {
         eval { $cpz->lower( 'smc_fvg_zone', 'candle' ) };
         eval { $cpz->lower( 'smc_ob_zone',  'candle' ) };
+        # Zonas Supply/Demand de Strategy Builder: mismo criterio, detras de las
+        # velas (sus lineas/senales conservan el tag 'overlay_strategy' al frente).
+        eval { $cpz->lower( 'strategy_zone', 'candle' ) };
     }
 
     # Colocar TODAS las etiquetas encoladas (por encima de velas/lineas),

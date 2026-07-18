@@ -72,6 +72,10 @@ sub render {
     my $src = $self->{source};
     return unless $src;
 
+    # Ancho del area de grafico de este frame: lo usa _chip para no dibujar
+    # etiquetas sobre la regleta de precios (borde derecho) ni fuera del plot.
+    $self->{_plot_w} = $scale->_plot_w;
+
     my @placed;   # cajas [x1,y1,x2,y2] de etiquetas ya colocadas (anti-solape)
     $self->_render_swings( $canvas, $scale, $src )            if $self->{show_swing};
     $self->_render_levels( $canvas, $scale, $src, \@placed );
@@ -93,12 +97,30 @@ sub _render_levels {
     my $plot_w = $scale->_plot_w;
     my $x_lim  = $off + $vb;
 
+    # Borde derecho REAL: la linea resting no debe extenderse mas alla de la
+    # ultima vela cargada (Req 9). Sin un feed en vivo, dibujar hasta plot_w
+    # invadiria el margen vacio a la derecha. Se usa la ultima vela del
+    # MarketData (consciente de la frontera de replay); si no esta disponible,
+    # se cae al comportamiento anterior (plot_w).
+    my $x_right = $plot_w;
+    my $md = $src->can('get_market_data') ? $src->get_market_data : undef;
+    if ( $md ) {
+        my $li = $md->last_index;
+        if ( defined $li && $li >= 0 ) {
+            my $xl = $scale->index_to_center_x($li);
+            $x_right = $xl if $xl < $x_right;
+        }
+    }
+
     for my $kind ( 'buy', 'sell' ) {
         next if $kind eq 'buy'  && !$self->{show_bsl};
         next if $kind eq 'sell' && !$self->{show_ssl};
 
+        # "Resting" = nivel ACTIVO (DETECTED). En cuanto es barrido (SWEPT) el
+        # nivel se considera CONSUMIDO y su linea desaparece de forma
+        # determinista: no se dibuja como liquidez en reposo (Req 5/6).
         my @resting = grep {
-            $_->{side} eq $kind && $_->{state} ne 'RESOLVED'
+            $_->{side} eq $kind && $_->{state} eq 'DETECTED'
         } @$levels;
         @resting = @resting[ -MAX_LINES .. -1 ] if @resting > MAX_LINES;
 
@@ -112,13 +134,15 @@ sub _render_levels {
             my $y  = $scale->value_to_y( $lv->{price} );
             my $x1 = $scale->index_to_center_x( $lv->{index} );
             $x1 = 0 if $x1 < 0;
-            next if $x1 >= $plot_w;
+            next if $x1 >= $x_right;   # origen ya en/despues de la ultima vela
 
             $canvas->createLine(
-                $x1, $y, $plot_w, $y,
+                $x1, $y, $x_right, $y,
                 -fill => $color, -dash => [ 2, 3 ], -width => 1, -tags => [TAG] );
 
-            $self->_chip( $canvas, $plot_w - 20, $y, $text,
+            # Chip junto al extremo derecho de la linea (ultima vela real); el
+            # clamp horizontal de _chip lo mantiene dentro del area de grafico.
+            $self->_chip( $canvas, $x_right, $y, $text,
                 -color => $color, -style => 'outline', -place => 'center',
                 -placed => $placed );
         }
@@ -154,7 +178,12 @@ sub _render_swings {
 }
 
 # -----------------------------------------------------------------------------
-# EQH / EQL: linea punteada que conecta ambos pivotes iguales + chip outline.
+# EQH / EQL: zona de liquidez de >=2 toques "iguales". Se dibuja una linea
+# horizontal punteada al precio REPRESENTATIVO (extremo del cluster) desde el
+# primer al ultimo toque, con un marcador por toque y un chip "EQH/EQL" (xN si
+# hay mas de 2). Solo se dibuja mientras el grupo esta ACTIVO: al barrerse su
+# nivel extremo (level.state != DETECTED) la zona desaparece de forma
+# determinista, igual que las lineas BSL/SSL resting.
 # -----------------------------------------------------------------------------
 sub _render_equals {
     my ( $self, $canvas, $scale, $src, $placed ) = @_;
@@ -163,31 +192,45 @@ sub _render_equals {
     my $off = $scale->{offset};
     my $vb  = $scale->{visible_bars};
 
-    for my $e (@$eqs) {
-        my $is_high = ( $e->{kind} eq 'EQH' );
+    for my $g (@$eqs) {
+        my $is_high = ( $g->{kind} eq 'EQH' );
         next if $is_high  && !$self->{show_eqh};
         next if !$is_high && !$self->{show_eql};
 
-        next if $e->{i2} < $off || $e->{i1} > $off + $vb;
-        next unless $scale->value_in_range( $e->{p1} )
-                 || $scale->value_in_range( $e->{p2} );
+        # ACTIVO: derivado del nivel del toque extremo (consumo => zona fuera).
+        next unless $g->{level} && $g->{level}{state} eq 'DETECTED';
 
-        my $x1 = $scale->index_to_center_x( $e->{i1} );
-        my $x2 = $scale->index_to_center_x( $e->{i2} );
-        my $y1 = $scale->value_to_y( $e->{p1} );
-        my $y2 = $scale->value_to_y( $e->{p2} );
+        my $pts = $g->{points} or next;
+        my $i1  = $pts->[0]{index};
+        my $i2  = $pts->[-1]{index};
+        next if $i2 < $off || $i1 > $off + $vb;
 
-        # Recorte horizontal: i2 puede caer a la derecha de la ventana y la
-        # linea de EQH/EQL invadiria la regleta de precios. Se acorta al borde
-        # (mismo criterio que ZigZag) y el chip se ubica sobre el trazo ya
-        # recortado para que tampoco quede sobre la escala.
-        ( $x1, $y1, $x2, $y2 ) = $scale->clip_line_x( $x1, $y1, $x2, $y2 );
+        my $price = $g->{price};
+        next unless $scale->value_in_range($price);
+
+        # Linea horizontal al nivel representativo, del primer al ultimo toque.
+        my $y = $scale->value_to_y($price);
+        my ( $x1, $ya, $x2, $yb ) =
+            $scale->clip_line_x( $scale->index_to_center_x($i1), $y,
+                                 $scale->index_to_center_x($i2), $y );
         next unless defined $x1;
 
-        $canvas->createLine( $x1, $y1, $x2, $y2,
+        $canvas->createLine( $x1, $ya, $x2, $yb,
             -fill => C_EQ, -width => 1, -dash => [ 4, 2 ], -tags => [TAG] );
 
-        $self->_chip( $canvas, ( $x1 + $x2 ) / 2, ( $y1 + $y2 ) / 2, $e->{kind},
+        # Marcador por cada toque visible (evidencia el cluster de iguales).
+        for my $p (@$pts) {
+            next if $p->{index} < $off || $p->{index} > $off + $vb;
+            next unless $scale->value_in_range( $p->{price} );
+            my $px = $scale->index_to_center_x( $p->{index} );
+            my $py = $scale->value_to_y( $p->{price} );
+            $canvas->createOval( $px - 2, $py - 2, $px + 2, $py + 2,
+                -outline => C_EQ, -fill => '#ffffff', -tags => [TAG] );
+        }
+
+        my $n     = scalar @$pts;
+        my $label = $n > 2 ? "$g->{kind} x$n" : $g->{kind};
+        $self->_chip( $canvas, ( $x1 + $x2 ) / 2, $ya, $label,
             -color => C_EQ, -style => 'outline',
             -place => ( $is_high ? 'above' : 'below' ), -placed => $placed );
     }
@@ -321,6 +364,19 @@ sub _chip {
     return unless @bb;
     my ( $x1, $y1, $x2, $y2 ) = @bb;
     $x1 -= $pad; $x2 += $pad; $y1 -= 1; $y2 += 1;
+
+    # Clamp HORIZONTAL: mantener el chip dentro del area de grafico (no invadir
+    # la regleta de precios por la derecha ni salir por la izquierda). Desplaza
+    # texto y caja juntos; el anti-solape de abajo solo mueve en vertical (Req 9).
+    if ( defined $self->{_plot_w} ) {
+        my $dx = 0;
+        $dx = $self->{_plot_w} - $x2 if $x2 > $self->{_plot_w};
+        $dx = -$x1 if $x1 + $dx < 0;
+        if ( $dx != 0 ) {
+            $x1 += $dx; $x2 += $dx;
+            $canvas->move( $tid, $dx, 0 );
+        }
+    }
 
     if ($placed) {
         my $dir   = $place eq 'below' ? 1 : -1;
