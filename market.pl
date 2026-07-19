@@ -26,6 +26,9 @@ use Market::Overlays::SMC_Structures;
 use Market::Overlays::Liquidity;
 use Market::Indicators::ZigZag;
 use Market::Overlays::ZigZag;
+use Market::Overlays::Fibonacci;
+use Market::Indicators::DailyLevels;
+use Market::Overlays::DailyLevels;
 use Market::Indicators::Strategy_Builder;   # FASE-2.3: DIY Custom Strategy Builder
 use Market::Overlays::Strategy_Builder;
 use Market::Indicators::VolumeProfile;       # FASE-2.4: Perfil de Volumen avanzado
@@ -248,6 +251,12 @@ $ind_manager->register('vp',        $vp_ind);    # (9) Volume Profile (lee event
 $ind_manager->register('vwap',      $vwap_ind);  # (10) Anchored VWAP (lee SMC + VP)
 $ind_manager->register('strategy',  $sb_ind);    # (11) Strategy Builder (independiente)
 
+# Soporte/Resistencia por coincidencia mas cercana (revision ingeniero,
+# entrega 2): independiente, lee D/4h directo de MarketData, no depende de
+# ningun otro indicador de esta lista.
+my $daily_lv_ind = Market::Indicators::DailyLevels->new;
+$ind_manager->register('daily_lv',  $daily_lv_ind);
+
 print "Calculando indicadores (ATR, Liquidity, SMC)...\n";
 $ind_manager->rebuild_all($market);
 printf "ATR: %d  |  swings: %d  |  eventos liq: %d  |  FVGs: %d\n",
@@ -271,6 +280,12 @@ $overlay_mgr->register('liquidity', $liq_overlay, visible => 0);
 
 my $zz_overlay = Market::Overlays::ZigZag->new( source => $zz_ind );
 $overlay_mgr->register('zigzag', $zz_overlay, visible => 0);
+
+my $fib_overlay = Market::Overlays::Fibonacci->new( source => $zz_ind );
+$overlay_mgr->register('fibonacci', $fib_overlay, visible => 0);
+
+my $daily_lv_overlay = Market::Overlays::DailyLevels->new( source => $daily_lv_ind );
+$overlay_mgr->register('daily_lv', $daily_lv_overlay, visible => 0);
 
 my $sb_overlay = Market::Overlays::Strategy_Builder->new( source => $sb_ind );  # FASE-2.3
 $overlay_mgr->register('strategy', $sb_overlay, visible => 0);
@@ -956,6 +971,43 @@ for my $res (@ZZ_RES_OPTIONS) {
     $zz_res_btns{$res} = $btn;
     $zz_res_i++;
 }
+
+# Fibonacci es un OVERLAY INDEPENDIENTE (no un flag del zigzag) porque solo
+# necesita LEER los segmentos ya confirmados del ZigZag externo -- ver
+# Overlays::Fibonacci. Se ubica en esta columna porque conceptualmente
+# depende del externo, pero su visibilidad se maneja aparte en OverlayManager.
+my $fib_visible = 0;
+$make_chk->($col_zz, 'Fibonacci (tramo estable)', \$fib_visible, sub {
+    $overlay_mgr->set_visible('fibonacci', $fib_visible);
+    $engine->request_render;
+});
+
+# =============================================================================
+# Columna SOPORTE/RESISTENCIA (Daily HL / 4H HL, coincidencia mas cercana,
+# revision del ingeniero, entrega 2). Independiente de la TF activa --
+# "Show Daily HL" pedido explicitamente visible desde 1m.
+# =============================================================================
+my %SR = ( show_daily => 0, show_4h => 0 );
+my $sr_master = 0;
+my $refresh_sr = sub {
+    $daily_lv_overlay->set_flag($_, $SR{$_}) for keys %SR;
+    my $any = 0; $any ||= $SR{$_} for keys %SR;
+    $overlay_mgr->set_visible('daily_lv', $any ? 1 : 0);
+    $engine->request_render;
+};
+my $sync_sr_master = sub {
+    my $all = 1; $all &&= $SR{$_} for keys %SR;
+    $sr_master = $all ? 1 : 0;
+};
+my $leaf_sr = sub { $refresh_sr->(); $sync_sr_master->(); };
+
+my $col_sr = $make_col->('Soporte/Resistencia', '#6d4c41');
+$make_chk->($col_sr, 'Activar S/R', \$sr_master, sub {
+    $SR{$_} = $sr_master for keys %SR;
+    $refresh_sr->();
+});
+$make_chk->($col_sr, 'Show Daily HL', \$SR{show_daily}, $leaf_sr);
+$make_chk->($col_sr, 'Show 4H HL',    \$SR{show_4h},    $leaf_sr);
 
 # =============================================================================
 # PRIMER RENDER

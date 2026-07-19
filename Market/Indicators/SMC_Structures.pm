@@ -404,13 +404,13 @@ sub _update_leg_scope {
     }
 }
 
-# _emit: registra el evento BOS/CHoCH. $scope distingue interno ('internal')
-# de externo ('external'); ambos comparten texto de etiqueta ("BOS"/"CHoCH") y
-# color (solo por direccion), el scope solo cambia el ESTILO de linea/chip
-# -- ver Overlays::SMC_Structures::_render_events (punteada+chico=interno,
-# solida+normal=externo, igual convencion que ZigZag interno/externo).
-# El Order Block solo se busca para eventos INTERNOS (comportamiento previo);
-# el scope externo marca estructura mayor pero no genera OB propio.
+# FIX (entrega 2, revision ingeniero): antes SOLO se generaba Order Block
+# para eventos de scope INTERNO ("return unless $scope eq 'internal'"), asi
+# que ningun BOS/CHoCH externo producia OB propio -- por eso no se veian ni
+# se calculaban los OB externos. Ahora ambos scopes buscan su OB; se propaga
+# $scope al OB para que el overlay lo diferencie visualmente con el mismo
+# criterio ya usado en BOS/CHoCH (interno=punteado/chip chico,
+# externo=solido/chip normal).
 sub _emit {
     my ($self, $type, $dir, $i, $price, $origin, $scope) = @_;
     $scope //= 'internal';
@@ -431,13 +431,12 @@ sub _emit {
         liq_confluence => undef,
     };
 
-    return unless $scope eq 'internal';
-
     # Order Block: ultimo cuerpo contra-tendencia entre origin e i-1
     my $ob_dir   = ($dir eq 'up') ? 'bull' : 'bear';
     my $ob_start = defined($origin) ? $origin : (_max(0, $i - 30));
     my $ob = $self->_find_order_block($ob_dir, $ob_start, $i - 1);
     if ($ob) {
+        $ob->{scope} = $scope;
         push @{ $self->{_order_blocks} }, $ob;
         push @{ $self->{_active_obs} },   $ob;
     }

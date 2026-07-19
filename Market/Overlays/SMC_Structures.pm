@@ -293,23 +293,26 @@ sub _render_obs {
         my $yb = $scale->value_to_y($ob->{zone_low});
         next if $yb - $yt < 2;
 
-        my $color = ($ob->{dir} eq 'bull') ? C_OB_BULL : C_OB_BEAR;
-        my $fill  = _mix($color, 0.15);
+        my $color  = ($ob->{dir} eq 'bull') ? C_OB_BULL : C_OB_BEAR;
+        my $fill   = _mix($color, 0.15);
+        my $is_ext = (($ob->{scope} // 'internal') eq 'external');
 
         $canvas->createRectangle($x1, $yt, $x2, $yb,
             -fill    => $fill,
             -outline => $color,
-            -width   => 1,
-            -dash    => [4, 3],
+            -width   => ($is_ext ? 2 : 1),
+            ($is_ext ? () : (-dash => [4, 3])),
             -tags    => [TAG, TAG_OB]);
 
-        # Etiqueta "OB" en el lado izquierdo de la zona (maxima prioridad)
+        # Etiqueta "OB" en el lado izquierdo de la zona (maxima prioridad).
+        # Externo = chip normal, interno = chip chico (mismo criterio que
+        # ya usa el overlay para BOS/CHoCH).
         my $cy = ($yt + $yb) / 2;
         my $label = ($ob->{dir} eq 'bull') ? 'OB+' : 'OB-';
         $self->_label($placer, $canvas, $x1 + 20, $cy, $label,
             color => $color, style => 'solid', side => 'center',
             priority => 1, hideable => 0,
-            font => 'TkDefaultFont 7 bold');
+            font => ($is_ext ? 'TkDefaultFont 8 bold' : 'TkDefaultFont 7 bold'));
     }
 }
 
