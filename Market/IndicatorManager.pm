@@ -105,4 +105,24 @@ sub reset_all {
     }
 }
 
+# -----------------------------------------------------------------------------
+# rebuild_one
+# Reinicia y recalcula UN SOLO indicador (por nombre), sin tocar el resto.
+# Uso: cambio de un parametro propio de un indicador (ej: resolucion del
+# zigzag interno) que no requiere recalcular indicadores que no dependen
+# de el en tiempo real (solo se leen en la siguiente vela via update_at_index).
+# -----------------------------------------------------------------------------
+sub rebuild_one {
+    my ($self, $name, $market_data) = @_;
+    my $ind = $self->{indicators}{$name} or return;
+
+    $ind->reset;
+    return unless $ind->can('update_at_index');
+
+    my $size = $market_data->size;
+    for my $i (0 .. $size - 1) {
+        $ind->update_at_index($market_data, $i);
+    }
+}
+
 1;

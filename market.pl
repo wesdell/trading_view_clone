@@ -800,31 +800,6 @@ $make_chk->($col_liq, 'Grabs',   \$LIQ{show_grabs},  $leaf_liq);
 $make_chk->($col_liq, 'Runs',    \$LIQ{show_runs},   $leaf_liq);
 
 # =============================================================================
-# Columna ZIGZAG (Interno verde/rojo + Externo azul)
-# =============================================================================
-my %ZZ = ( show_internal => 0, show_external => 0 );
-my $zz_master = 0;
-my $refresh_zz = sub {
-    $zz_overlay->set_flag($_, $ZZ{$_}) for keys %ZZ;
-    my $any = 0; $any ||= $ZZ{$_} for keys %ZZ;
-    $overlay_mgr->set_visible('zigzag', $any ? 1 : 0);
-    $engine->request_render;
-};
-my $sync_zz_master = sub {
-    my $all = 1; $all &&= $ZZ{$_} for keys %ZZ;
-    $zz_master = $all ? 1 : 0;
-};
-my $leaf_zz = sub { $refresh_zz->(); $sync_zz_master->(); };
-
-my $col_zz = $make_col->('ZigZag', '#1e88e5');
-$make_chk->($col_zz, 'Activar ZigZag', \$zz_master, sub {
-    $ZZ{$_} = $zz_master for keys %ZZ;
-    $refresh_zz->();
-});
-$make_chk->($col_zz, 'Interno (30m)',   \$ZZ{show_internal}, $leaf_zz);
-$make_chk->($col_zz, 'Externo (150)',   \$ZZ{show_external}, $leaf_zz);
-
-# =============================================================================
 # Columna STRATEGY BUILDER (SuperTrend / HalfTrend / Range Filter /
 # Supply / Demand / Senales). FASE-2.3. Mismos controles/patron existentes.
 # =============================================================================
@@ -901,6 +876,86 @@ $make_chk->($col_av, 'Apertura mercado', \$AV{show_open},   $leaf_av);
 $make_chk->($col_av, 'BOS',   \$AV{show_bos},   $leaf_av);
 $make_chk->($col_av, 'CHoCH', \$AV{show_choch}, $leaf_av);
 $make_chk->($col_av, 'POC',   \$AV{show_poc},   $leaf_av);
+
+# =============================================================================
+# Columna ZIGZAG (Interno verde/rojo + Externo azul) — ultima columna: la
+# resolucion del interno se elige con una fila de botones horizontales
+# (mismo patron visual que el selector de temporalidad del grafico), no con
+# un Optionmenu (no abria el menu de forma confiable en Tk).
+# =============================================================================
+my %ZZ = ( show_internal => 0, show_external => 0 );
+my $zz_master = 0;
+my $refresh_zz = sub {
+    $zz_overlay->set_flag($_, $ZZ{$_}) for keys %ZZ;
+    my $any = 0; $any ||= $ZZ{$_} for keys %ZZ;
+    $overlay_mgr->set_visible('zigzag', $any ? 1 : 0);
+    $engine->request_render;
+};
+my $sync_zz_master = sub {
+    my $all = 1; $all &&= $ZZ{$_} for keys %ZZ;
+    $zz_master = $all ? 1 : 0;
+};
+my $leaf_zz = sub { $refresh_zz->(); $sync_zz_master->(); };
+
+my $col_zz = $make_col->('ZigZag', '#1e88e5');
+$make_chk->($col_zz, 'Activar ZigZag', \$zz_master, sub {
+    $ZZ{$_} = $zz_master for keys %ZZ;
+    $refresh_zz->();
+});
+$make_chk->($col_zz, 'Interno',   \$ZZ{show_internal}, $leaf_zz);
+$make_chk->($col_zz, 'Externo (150)',   \$ZZ{show_external}, $leaf_zz);
+
+# --- Resolucion del ZigZag interno (equivalente al input "ZigZag Resolution"
+# del ZZMTF de TradingView). Cambiarla solo recalcula el zigzag interno
+# (Market::IndicatorManager::rebuild_one) -- el resto de indicadores
+# (externo, liquidity, SMC, etc.) no se tocan.
+$col_zz->Label(-text => 'Interno - Resolucion:', -background => $PANEL_BG,
+    -foreground => '#787b86', -font => 'TkDefaultFont 8')
+    ->pack(-side => 'top', -anchor => 'w', -pady => [6, 0]);
+
+my @ZZ_RES_OPTIONS = qw(1m 2m 3m 5m 10m 15m 30m 45m 1h 2h 3h 4h 1D 1S);
+my $zz_int_res = '30m';   # debe calzar con int_tf_mins=>30 del constructor
+my %zz_res_btns;
+
+my $zz_res_row1 = $col_zz->Frame(-background => $PANEL_BG);
+$zz_res_row1->pack(-side => 'top', -anchor => 'w', -fill => 'x');
+my $zz_res_row2 = $col_zz->Frame(-background => $PANEL_BG);
+$zz_res_row2->pack(-side => 'top', -anchor => 'w', -fill => 'x');
+
+my $apply_zz_resolution = sub {
+    my $mins = $Market::Indicators::ZigZag::RESOLUTION_MINUTES{$zz_int_res}
+        or return;
+    $zz_ind->set_int_resolution($mins);
+    $ind_manager->rebuild_one('zigzag', $market);
+    $engine->request_render;
+};
+
+my $zz_res_i = 0;
+for my $res (@ZZ_RES_OPTIONS) {
+    my $row = $zz_res_i < 7 ? $zz_res_row1 : $zz_res_row2;
+    my $btn = $row->Button(
+        -text             => $res,
+        -background       => $PANEL_BG,
+        -activebackground => $PANEL_BG,
+        -foreground       => ($res eq $zz_int_res ? '#2962ff' : '#787b86'),
+        -relief           => 'flat',
+        -bd               => 0,
+        -font             => 'TkDefaultFont 8 bold',
+        -padx             => 3,
+        -pady             => 1,
+        -command          => sub {
+            return if $zz_int_res eq $res;
+            $zz_int_res = $res;
+            for my $k (keys %zz_res_btns) {
+                $zz_res_btns{$k}->configure(
+                    -foreground => ($k eq $res ? '#2962ff' : '#787b86'));
+            }
+            $apply_zz_resolution->();
+        },
+    )->pack(-side => 'left', -padx => 1, -pady => 1);
+    $zz_res_btns{$res} = $btn;
+    $zz_res_i++;
+}
 
 # =============================================================================
 # PRIMER RENDER

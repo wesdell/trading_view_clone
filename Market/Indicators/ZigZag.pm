@@ -50,12 +50,23 @@ package Market::Indicators::ZigZag;
 
 use strict;
 use warnings;
+use Time::Moment;
 
 # INTERNO: ventana en velas de 1m = int_period * minutos_tf
 # Con int_period=2 y tf=30m: 2*30=60 velas de 1m
 use constant INT_PERIOD  => 2;
 use constant INT_TF_MINS => 30;    # minutos del tf del ZZMTF
 use constant EXT_LENGTH  => 150;   # ventana del ZigZag Volume Profile
+
+# Minutos equivalentes de cada opcion de "Resolucion" del zigzag interno
+# (dropdown en market.pl). 1440 = 1D y 10080 = 1S (semana) son casos
+# especiales de calendario, ver _bucket_ts.
+our %RESOLUTION_MINUTES = (
+    '1m' => 1,     '2m' => 2,     '3m' => 3,     '5m' => 5,
+    '10m' => 10,   '15m' => 15,   '30m' => 30,   '45m' => 45,
+    '1h' => 60,    '2h' => 120,   '3h' => 180,   '4h' => 240,
+    '1D' => 1440,  '1S' => 10080,
+);
 
 sub new {
     my ( $class, %args ) = @_;
@@ -92,6 +103,19 @@ sub new {
     bless $self, $class;
     return $self;
 }
+
+# -----------------------------------------------------------------------------
+# set_int_resolution: cambia la resolucion del zigzag interno en caliente
+# (dropdown de market.pl). NO recalcula por si solo: el llamador debe hacer
+# reset() + rebuild (ver IndicatorManager::rebuild_one) para reconstruir
+# los segmentos con la nueva ventana.
+# -----------------------------------------------------------------------------
+sub set_int_resolution {
+    my ($self, $tf_mins) = @_;
+    $self->{int_tf_mins} = $tf_mins;
+}
+
+sub get_int_resolution { return $_[0]->{int_tf_mins}; }
 
 sub get_values      { return []; }
 sub get_market_data { return $_[0]->{_market_data}; }
@@ -174,15 +198,51 @@ sub update_at_index {
 # Ancla horaria (GMT-5) usada para alinear los buckets de int_tf_mins,
 # igual que Market::MarketData::_bucket_ts_for para timeframes intradia.
 use constant INT_LOCAL_OFFSET_SEC => 5 * 3600;
+use constant SESSION_OPEN_SEC     => 17 * 3600;   # apertura de sesion CME, 17:00 local
+use constant SESSION_OPEN_MIN     => 17 * 60;
+use constant GMT_OFFSET_MIN       => -300;        # GMT-5 para Time::Moment
 
 # -----------------------------------------------------------------------------
-# _bucket_ts: timestamp de inicio del bucket de tamano $interval_sec al que
-# pertenece $ts (mismo anclaje que usa Market::MarketData para construir 30m).
+# _bucket_ts: timestamp de inicio del bucket de resolucion $tf_mins (minutos)
+# al que pertenece $ts.
+#
+#   - tf_mins < 1440 (intradia): bucketing directo sobre el epoch, anclado a
+#     la apertura de sesion (17:00 local), igual que Market::MarketData
+#     ::_bucket_ts_for. Todas las opciones del dropdown (1..240 min) dividen
+#     exacto a 1440, asi que el ancla es estable.
+#   - tf_mins == 1440 (1D) o 10080 (1S/semana): NO se puede resolver con
+#     division entera de segundos -- una semana no es un multiplo de 7 dias
+#     alineado al epoch Unix (1-ene-1970 fue jueves), y el "dia de trading"
+#     CME va 17:00->16:00 del dia siguiente, etiquetado por fecha de CIERRE.
+#     Se replica la misma logica de calendario que
+#     Market::MarketData::_bucket_ts_for para D/W.
 # -----------------------------------------------------------------------------
 sub _bucket_ts {
-    my ($self, $ts, $interval_sec) = @_;
-    my $local = $ts - INT_LOCAL_OFFSET_SEC;
-    return int( $local / $interval_sec ) * $interval_sec + INT_LOCAL_OFFSET_SEC;
+    my ($self, $ts, $tf_mins) = @_;
+
+    if ($tf_mins < 1440) {
+        my $interval_sec = $tf_mins * 60;
+        my $shifted = $ts - INT_LOCAL_OFFSET_SEC - SESSION_OPEN_SEC;
+        return int( $shifted / $interval_sec ) * $interval_sec
+             + SESSION_OPEN_SEC + INT_LOCAL_OFFSET_SEC;
+    }
+
+    my $tm    = Time::Moment->from_epoch($ts)->with_offset_same_instant(GMT_OFFSET_MIN);
+    my $mins  = $tm->hour * 60 + $tm->minute;
+    my $close = ($mins >= SESSION_OPEN_MIN) ? $tm->plus_days(1) : $tm;
+
+    if ($tf_mins == 1440) {
+        return $self->_truncate_to_midnight($close)->epoch;
+    }
+
+    # 1S (semana): etiquetada por el lunes de la semana de cierre.
+    my $dow = $close->day_of_week;   # 1=Lunes .. 7=Domingo (ISO 8601)
+    return $self->_truncate_to_midnight($close)->minus_days($dow - 1)->epoch;
+}
+
+sub _truncate_to_midnight {
+    my ($self, $tm) = @_;
+    return $tm->with_hour(0)->with_minute(0)->with_second(0)->with_nanosecond(0);
 }
 
 # =============================================================================
@@ -193,10 +253,10 @@ sub _bucket_ts {
 sub _update_internal {
     my ($self, $data, $last_vis) = @_;
 
-    my $prd        = $self->{int_period};
-    my $interval_s = $self->{int_tf_mins} * 60;
-    my $segs       = $self->{_int_segments};
-    my $newbars    = $self->{_int_newbar_idx};
+    my $prd     = $self->{int_period};
+    my $tf_mins = $self->{int_tf_mins};
+    my $segs    = $self->{_int_segments};
+    my $newbars = $self->{_int_newbar_idx};
 
     my $start = $self->{_int_last_idx} + 1;
 
@@ -205,7 +265,7 @@ sub _update_internal {
         $self->{_int_last_idx} = $i;
 
         # newbar: primera vela 1m de un nuevo tramo de int_tf_mins.
-        my $bucket = $self->_bucket_ts( $c->{ts}, $interval_s );
+        my $bucket = $self->_bucket_ts( $c->{ts}, $tf_mins );
         if ( !defined $self->{_int_last_bucket} || $bucket != $self->{_int_last_bucket} ) {
             push @$newbars, $i;
             shift @$newbars while @$newbars > $prd;
