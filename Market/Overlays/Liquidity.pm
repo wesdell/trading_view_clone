@@ -178,12 +178,13 @@ sub _render_swings {
 }
 
 # -----------------------------------------------------------------------------
-# EQH / EQL: zona de liquidez de >=2 toques "iguales". Se dibuja una linea
-# horizontal punteada al precio REPRESENTATIVO (extremo del cluster) desde el
-# primer al ultimo toque, con un marcador por toque y un chip "EQH/EQL" (xN si
-# hay mas de 2). Solo se dibuja mientras el grupo esta ACTIVO: al barrerse su
-# nivel extremo (level.state != DETECTED) la zona desaparece de forma
-# determinista, igual que las lineas BSL/SSL resting.
+# EQH / EQL -- paridad con el indicador de referencia (LuxAlgo SMC,
+# drawEqualHighLow): cada par es un PAR AISLADO de 2 pivotes (Indicators::
+# Liquidity::_eq_update ya no arma clusters de N toques), asi que la linea va
+# de punta de mecha a punta de mecha EXACTA de ambos pivotes -- casi siempre
+# ligeramente diagonal, nunca perfectamente horizontal salvo coincidencia
+# exacta de precio. El chip "EQH"/"EQL" (sin sufijo "xN") se ancla al precio
+# del pivote NUEVO (el mas reciente), igual que la referencia.
 # -----------------------------------------------------------------------------
 sub _render_equals {
     my ( $self, $canvas, $scale, $src, $placed ) = @_;
@@ -197,28 +198,25 @@ sub _render_equals {
         next if $is_high  && !$self->{show_eqh};
         next if !$is_high && !$self->{show_eql};
 
-        # ACTIVO: derivado del nivel del toque extremo (consumo => zona fuera).
-        next unless $g->{level} && $g->{level}{state} eq 'DETECTED';
-
         my $pts = $g->{points} or next;
-        my $i1  = $pts->[0]{index};
-        my $i2  = $pts->[-1]{index};
-        next if $i2 < $off || $i1 > $off + $vb;
+        my ( $p1, $p2 ) = @$pts;
+        next if $p2->{index} < $off || $p1->{index} > $off + $vb;
+        next unless $scale->value_in_range( $p1->{price} )
+                 || $scale->value_in_range( $p2->{price} );
 
-        my $price = $g->{price};
-        next unless $scale->value_in_range($price);
-
-        # Linea horizontal al nivel representativo, del primer al ultimo toque.
-        my $y = $scale->value_to_y($price);
+        # Linea de punta de mecha a punta de mecha (diagonal si los precios
+        # de ambos pivotes no son identicos, igual que la referencia).
         my ( $x1, $ya, $x2, $yb ) =
-            $scale->clip_line_x( $scale->index_to_center_x($i1), $y,
-                                 $scale->index_to_center_x($i2), $y );
+            $scale->clip_line_x( $scale->index_to_center_x( $p1->{index} ),
+                                  $scale->value_to_y( $p1->{price} ),
+                                  $scale->index_to_center_x( $p2->{index} ),
+                                  $scale->value_to_y( $p2->{price} ) );
         next unless defined $x1;
 
         $canvas->createLine( $x1, $ya, $x2, $yb,
             -fill => C_EQ, -width => 1, -dash => [ 4, 2 ], -tags => [TAG] );
 
-        # Marcador por cada toque visible (evidencia el cluster de iguales).
+        # Marcador en cada pivote visible.
         for my $p (@$pts) {
             next if $p->{index} < $off || $p->{index} > $off + $vb;
             next unless $scale->value_in_range( $p->{price} );
@@ -228,9 +226,8 @@ sub _render_equals {
                 -outline => C_EQ, -fill => '#ffffff', -tags => [TAG] );
         }
 
-        my $n     = scalar @$pts;
-        my $label = $n > 2 ? "$g->{kind} x$n" : $g->{kind};
-        $self->_chip( $canvas, ( $x1 + $x2 ) / 2, $ya, $label,
+        # Chip anclado al pivote NUEVO (segundo punto -> x2,yb).
+        $self->_chip( $canvas, ( $x1 + $x2 ) / 2, $yb, $g->{kind},
             -color => C_EQ, -style => 'outline',
             -place => ( $is_high ? 'above' : 'below' ), -placed => $placed );
     }

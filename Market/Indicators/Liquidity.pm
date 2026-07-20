@@ -25,15 +25,12 @@ package Market::Indicators::Liquidity;
 #                   (transicion DETECTED->SWEPT); undef mientras siga Activo.
 #     classification = evento que lo consumio (GRAB/SWEEP/RUN), lo fija la
 #                   maquina de estados en la fase de eventos.
-#   get_equals()       -> [ {kind:'EQH'|'EQL', side:'buy'|'sell',
-#                             points:[{index,ts,price},...], price, level,
-#                             last_index}, ... ]
-#     GRUPO/cluster de swings iguales (>=2 toques). 'points' conserva el
-#     timestamp de TODOS sus toques. 'price' = precio representativo (extremo:
-#     max de highs para EQH, min de lows para EQL) = nivel de consumo del grupo.
-#     'side' liga la zona a BSL(buy)/SSL(sell) que refuerza. 'level' = ref al
-#     nivel del toque extremo: el grupo esta ACTIVO mientras level.state eq
-#     'DETECTED' y CONSUMIDO (con level.consumed_ts) cuando ese nivel es barrido.
+#   get_equals()       -> [ {kind:'EQH'|'EQL', points:[{index,ts,price},...]
+#                             (siempre 2), price, last_index}, ... ]
+#     PAR aislado de 2 pivotes casi-iguales (paridad Pine, ver _eq_update):
+#     NO es un cluster de N toques ni esta ligado al estado Sweep/Grab/Run de
+#     BSL/SSL. 'price' = precio del pivote NUEVO (el mas reciente del par).
+#     Se dibuja siempre que estos 2 puntos entren en el rango visible.
 #   get_events()       -> [ {type:'SWEEP'|'GRAB'|'RUN', dir:'up'|'down',
 #                             index, price, label, level_id, side:'buy'|'sell',
 #                             break_ts, confirmed_ts, extreme, confirm_bars},...]
@@ -69,9 +66,20 @@ package Market::Indicators::Liquidity;
 #     sweep) -- nunca necesita mirar hacia adelante, por lo que no
 #     requiere ningun retraso adicional.
 #
-# EQH/EQL: dos swings del MISMO tipo (H/H o L/L) se consideran "iguales"
-# si |precio_1 - precio_2| <= ATR(en el indice del swing mas reciente)
-# * eq_factor (0.10 por defecto).
+# EQH/EQL: PARIDAD EXACTA con el indicador de referencia (LuxAlgo "Smart Money
+# Concepts Pro", getCurrentStructure(eqLenInp, equalHL=true) + drawEqualHighLow).
+# Es un sub-sistema INDEPENDIENTE de los swings/niveles BSL/SSL (que usan k=3
+# con ventana simetrica +/-k y filtro de prominencia ATR): EQH/EQL usa su PROPIO
+# pivote tipo "leg" (ver _eq_update), de una sola direccion (solo mira hacia
+# ADELANTE desde el candidato, igual que ta.highest/ta.lowest de Pine) y SIN
+# filtro de prominencia. Solo recuerda el ULTIMO pivote de cada tipo (no un
+# cluster de N toques): cada nuevo pivote se compara UNICAMENTE contra ese
+# ultimo pivote y, si son "iguales" (|precio_1 - precio_2| < eq_factor * ATR),
+# se emite un PAR aislado (no se fusiona con toques previos, replicando que el
+# Pine jamas dibuja una etiqueta "xN"). El pivote se actualiza SIEMPRE que
+# cambia de direccion, haya o no habido match -- de nuevo, igual que Pine.
+# El ATR usado es uno DEDICADO (periodo 200, igual que atrLenInp de refencia),
+# separado del ATR compartido con BSL/SSL/SMC para no alterar su calculo.
 #
 # Maquina de estados (5 estados, autoridad = Especificacion 2a Fase, seccion
 # 4.2-4.3) -- clasificacion EXCLUSIVA (un solo resultado por nivel), confirmada
@@ -108,17 +116,18 @@ package Market::Indicators::Liquidity;
 use strict;
 use warnings;
 
-# Tick minimo del E-mini Nasdaq (NQ) = 0.25 (mismo valor que ChartEngine::
-# PRICE_TICK). Sirve de PISO a la tolerancia EQH/EQL: la comparacion de precios
-# "iguales" nunca es mas estricta que la propia granularidad del mercado.
-use constant NQ_TICK => 0.25;
+use Market::Indicators::ATR;
+
+# ATR dedicado a EQH/EQL (atrLenInp=200 en la referencia LuxAlgo). Distinto
+# del ATR compartido (14) que usan BSL/SSL/prominencia/SMC.
+use constant EQ_ATR_PERIOD => 200;
 
 sub new {
     my ( $class, %args ) = @_;
     my $self = {
         k              => $args{k}              // 3,
-        eq_factor      => $args{eq_factor}      // 0.10,
-        eq_lookback    => $args{eq_lookback}    // 50,
+        eq_factor      => $args{eq_factor}      // 0.10,   # eqThreshInp (ref)
+        eq_len         => $args{eq_len}         // 3,       # eqLenInp    (ref)
         max_open_levels => $args{max_open_levels} // 150,
         track_volume    => defined $args{track_volume} ? $args{track_volume} : 1,
         # Autoridad = Especificacion 2a Fase (4.2-4.3): Grab = reclamo en un
@@ -137,13 +146,20 @@ sub new {
 
         swings => [],   # todos los swings confirmados, en orden de confirmacion
         levels => [],   # TODOS los niveles (cualquier estado), en orden de creacion
-        equals => [],   # pares EQH/EQL (puramente geometrico, no es un "nivel")
+        equals => [],   # pares EQH/EQL (paridad Pine: cada par es independiente)
         events => [],   # eventos Sweep/Grab/Run ya resueltos
 
         _open_level_refs      => [],   # niveles en DETECTED o SWEPT (working set)
         _next_id               => 1,
         _last_evaluated_index  => -1,  # ultimo candidato de swing ya evaluado
         _market_data           => undef,  # ref al MarketData (para get_market_data)
+
+        # ---- EQH/EQL (sub-sistema independiente, paridad Pine) ----
+        _eq_atr       => Market::Indicators::ATR->new(EQ_ATR_PERIOD),
+        _eq_last_i    => -1,     # ultimo indice ya procesado por _eq_update
+        _eq_leg_state => 0,      # var int legState = 0 (BEARISH_LEG) en Pine
+        _eq_high      => { currentLevel => undef, lastLevel => undef, barIndex => undef, barTime => undef },
+        _eq_low       => { currentLevel => undef, lastLevel => undef, barIndex => undef, barTime => undef },
 
         # Agregados del working set para el FAST-SKIP de la maquina de estados
         # (ver _update_state_machine). Permiten saltar en O(1) las velas en las
@@ -178,6 +194,12 @@ sub reset {
     $self->{_ws_max_sell} = -9e18;
     $self->{_ws_active}   = 0;
     $self->{_market_data} = undef;
+
+    $self->{_eq_atr}       = Market::Indicators::ATR->new(EQ_ATR_PERIOD);
+    $self->{_eq_last_i}    = -1;
+    $self->{_eq_leg_state} = 0;
+    $self->{_eq_high} = { currentLevel => undef, lastLevel => undef, barIndex => undef, barTime => undef };
+    $self->{_eq_low}  = { currentLevel => undef, lastLevel => undef, barIndex => undef, barTime => undef };
 }
 
 # -----------------------------------------------------------------------------
@@ -238,6 +260,7 @@ sub update_at_index {
     $self->{_market_data} = $market_data;
 
     $self->_update_state_machine( $market_data, $i );
+    $self->_eq_update( $market_data, $i );   # EQH/EQL: independiente de (2)
 
     my $k = $self->{k};
     my $c = $i - $k;
@@ -323,9 +346,9 @@ sub _register_swing {
     my $level = $self->_register_level( $kind, $swing, $market_data );
 
     # Back-ref swing -> su nivel (NO es un pivote nuevo: es el mismo swing).
-    # Lo usa el agrupador EQH/EQL para derivar el consumo de un grupo del estado
-    # del nivel de su toque extremo, sin re-escanear velas. (level->origin_swing_id
-    # apunta de vuelta por id, no por ref: no hay ciclo de referencias.)
+    # (level->origin_swing_id apunta de vuelta por id, no por ref: no hay
+    # ciclo de referencias.) EQH/EQL ya NO deriva de este swing/nivel -- ver
+    # _eq_update, sub-sistema independiente con su propio pivote.
     $swing->{_level} = $level;
 
     # ---- Working set: TODO nivel entra (ciclo de vida determinista) ----
@@ -356,8 +379,6 @@ sub _register_swing {
     # El working set cambio (nuevo nivel / cap): los agregados del fast-skip
     # deben recomputarse antes de la proxima evaluacion de la maquina de estados.
     $self->{_ws_dirty} = 1;
-
-    $self->_check_equal_levels( $kind, $swing, $level );
 }
 
 # -----------------------------------------------------------------------------
@@ -484,107 +505,105 @@ sub is_internal {
 }
 
 # -----------------------------------------------------------------------------
-# _check_equal_levels (privado) -- AGRUPADOR EQH/EQL (grupo/cluster, no pares)
+# _eq_update (privado) -- PARIDAD Pine getCurrentStructure(eqLenInp, true)
 #
-# Se llama SOLO cuando un swing acaba de CONFIRMARSE (en _register_swing), de
-# modo que un grupo nunca nace antes de que su SEGUNDO pivote este confirmado
-# (sin uso de futuro). Reutiliza los swings confirmados existentes; NO crea una
-# segunda lista de pivotes.
-#
-# Tolerancia DETERMINISTA (reutiliza la config del proyecto): eq_factor * ATR
-# (misma base ATR que la prominencia), con PISO de 1 tick de NQ. Nunca compara
-# con '=='. Como los precios de NQ son multiplos de 0.25, |dp| ya es multiplo
-# del tick; el piso garantiza que la tolerancia respete el tick minimo.
-#
-# CICLO DE VIDA del grupo:
-#   - creacion       : 2o pivote igual confirmado y aun ACTIVO (nivel DETECTED).
-#   - nuevos toques  : un 3er/4o pivote igual dentro de tolerancia se AGREGA al
-#                      grupo activo (no crea uno nuevo) -> sin duplicar zonas.
-#   - precio rep.    : extremo del cluster (max highs EQH / min lows EQL); su
-#                      nivel gobierna el consumo.
-#   - activo/consumo : DERIVADO del nivel del toque extremo (level.state /
-#                      level.consumed_ts) -> se reconstruye igual en Replay y no
-#                      toca la maquina Sweep/Grab/Run.
+# Pivote propio de EQH/EQL (funcion leg(size) de la referencia): en la vela
+# $i, el candidato es old = candle[i-size]. new_high/new_low comparan ESE
+# candidato SOLO contra las velas "hacia adelante" size[i-size+1 .. i] (nunca
+# hacia atras, a diferencia del fractal simetrico +/-k de BSL/SSL). El pivote
+# solo se "confirma" (y se compara contra el ULTIMO pivote del mismo tipo) la
+# PRIMERA vez que el estado leg cambia de signo -- ta.change(legV)!=0 en Pine
+# -- exactamente igual que aqui via $state != $prev_state. Esto reproduce el
+# comportamiento de alternancia estricta H/L de la referencia (no un cluster
+# de N toques: cada match es un PAR aislado, el pivote se sobreescribe SIEMPRE
+# que cambia de leg, haya o no match).
 # -----------------------------------------------------------------------------
-sub _check_equal_levels {
-    my ( $self, $kind, $new_swing, $new_level ) = @_;
-    return unless $self->{atr};
+sub _eq_update {
+    my ( $self, $market_data, $i ) = @_;
+    return if $i <= $self->{_eq_last_i};
+    $self->{_eq_last_i} = $i;
 
-    my $atr_values = $self->{atr}->get_values;
-    return unless $atr_values && @$atr_values;
-    my $atr_at_new = $atr_values->[ $new_swing->{index} ];
-    return unless defined $atr_at_new;
+    # ATR dedicado (periodo 200): se alimenta SIEMPRE, en orden, 1 vela = 1 tick.
+    $self->{_eq_atr}->update_at_index( $market_data, $i );
 
-    # Tolerancia = eq_factor*ATR con piso de 1 tick NQ (considera el tick minimo).
-    my $tolerance = $self->{eq_factor} * $atr_at_new;
-    $tolerance = NQ_TICK if $tolerance < NQ_TICK;
+    my $size = $self->{eq_len};
+    return if $i < $size;
 
-    my $is_high   = ( $kind eq 'H' );
-    my $eq_kind   = $is_high ? 'EQH' : 'EQL';
-    my $side      = $is_high ? 'buy' : 'sell';   # EQH refuerza BSL, EQL SSL
-    my $new_price = $new_swing->{price};
-    my $new_point = {
-        index => $new_swing->{index},
-        ts    => $new_swing->{ts},
-        price => $new_price,
-    };
+    my $old = $market_data->get_candle( $i - $size );
+    return unless $old;
 
-    my $equals   = $self->{equals};
-    my $lookback = $self->{eq_lookback};
+    my ( $hh, $ll );
+    for my $j ( ( $i - $size + 1 ) .. $i ) {
+        my $c = $market_data->get_candle($j) or next;
+        $hh = $c->{high} if !defined($hh) || $c->{high} > $hh;
+        $ll = $c->{low}  if !defined($ll) || $c->{low}  < $ll;
+    }
+    return unless defined $hh && defined $ll;
 
-    # (1) INCORPORAR el nuevo toque a un grupo ACTIVO del mismo tipo cuyo precio
-    #     representativo caiga dentro de tolerancia (NO crea grupo nuevo).
-    my $gstop = $#$equals - $lookback;
-    $gstop = 0 if $gstop < 0;
-    for ( my $g = $#$equals; $g >= $gstop; $g-- ) {
-        my $grp = $equals->[$g];
-        next unless $grp->{kind} eq $eq_kind;
-        next unless $grp->{level} && $grp->{level}{state} eq 'DETECTED';  # ACTIVO
-        next if abs( $grp->{price} - $new_price ) > $tolerance;
+    my $new_high = ( $old->{high} > $hh ) ? 1 : 0;
+    my $new_low  = ( $old->{low}  < $ll ) ? 1 : 0;
 
-        push @{ $grp->{points} }, $new_point;
-        $grp->{last_index} = $new_swing->{index};
-        $new_level->{eq_group} = $grp;   # referencia EQH/EQL del nivel que toca
-        # el extremo gobierna el precio representativo y el nivel de consumo
-        if ( $is_high ? ( $new_price > $grp->{price} )
-                      : ( $new_price < $grp->{price} ) ) {
-            $grp->{price} = $new_price;
-            $grp->{level} = $new_level;
+    my $prev_state = $self->{_eq_leg_state};
+    my $state      = $prev_state;
+    if ($new_high) {
+        $state = 0;   # BEARISH_LEG: candidato = pivote HIGH
+    }
+    elsif ($new_low) {
+        $state = 1;   # BULLISH_LEG: candidato = pivote LOW
+    }
+    return if $state == $prev_state;   # sin cambio de leg -> sin nuevo pivote
+    $self->{_eq_leg_state} = $state;
+
+    my $atr_vals = $self->{_eq_atr}->get_values;
+    my $atr_at   = $atr_vals->[$i];
+    my $tolerance = defined $atr_at ? $self->{eq_factor} * $atr_at : undef;
+
+    my $pivot_idx = $i - $size;
+    my $pivot_ts  = $old->{ts};
+
+    if ( $state == 1 ) {
+        my $p = $self->{_eq_low};
+        if ( defined $p->{currentLevel} && defined $tolerance
+             && abs( $p->{currentLevel} - $old->{low} ) < $tolerance ) {
+            $self->_push_equal( 'EQL', $p,
+                { index => $pivot_idx, ts => $pivot_ts, price => $old->{low} } );
         }
-        return;
+        $p->{lastLevel}    = $p->{currentLevel};
+        $p->{currentLevel} = $old->{low};
+        $p->{barIndex}     = $pivot_idx;
+        $p->{barTime}      = $pivot_ts;
     }
-
-    # (2) CREAR un grupo nuevo con el swing previo mas cercano del mismo tipo,
-    #     dentro de tolerancia y AUN ACTIVO (nivel DETECTED = liquidez en reposo).
-    my $swings = $self->{swings};
-    my $sstop  = $#$swings - $lookback;
-    $sstop = 0 if $sstop < 0;
-    for ( my $j = $#$swings; $j >= $sstop; $j-- ) {
-        my $prev = $swings->[$j];
-        next if $prev->{id} == $new_swing->{id};
-        next unless $prev->{kind} eq $kind;
-        next unless $prev->{_level} && $prev->{_level}{state} eq 'DETECTED';
-        next if abs( $prev->{price} - $new_price ) > $tolerance;
-
-        my $prev_extreme = $is_high ? ( $prev->{price} > $new_price )
-                                    : ( $prev->{price} < $new_price );
-        my $grp = {
-            kind       => $eq_kind,
-            side       => $side,
-            points     => [
-                { index => $prev->{index}, ts => $prev->{ts}, price => $prev->{price} },
-                $new_point,
-            ],
-            price      => $prev_extreme ? $prev->{price}  : $new_price,
-            level      => $prev_extreme ? $prev->{_level} : $new_level,
-            last_index => $new_swing->{index},
-        };
-        push @$equals, $grp;
-        # referencia EQH/EQL en AMBOS niveles del par (cuando existan)
-        $new_level->{eq_group}     = $grp;
-        $prev->{_level}{eq_group}  = $grp if $prev->{_level};
-        return;
+    else {
+        my $p = $self->{_eq_high};
+        if ( defined $p->{currentLevel} && defined $tolerance
+             && abs( $p->{currentLevel} - $old->{high} ) < $tolerance ) {
+            $self->_push_equal( 'EQH', $p,
+                { index => $pivot_idx, ts => $pivot_ts, price => $old->{high} } );
+        }
+        $p->{lastLevel}    = $p->{currentLevel};
+        $p->{currentLevel} = $old->{high};
+        $p->{barIndex}     = $pivot_idx;
+        $p->{barTime}      = $pivot_ts;
     }
+}
+
+# -----------------------------------------------------------------------------
+# _push_equal (privado): registra un PAR aislado EQH/EQL (pivote previo ->
+# pivote nuevo). 'price' = precio del pivote NUEVO (linea/etiqueta se ancla
+# ahi, igual que 'level' en drawEqualHighLow de la referencia).
+# -----------------------------------------------------------------------------
+sub _push_equal {
+    my ( $self, $kind, $prev_pivot, $new_point ) = @_;
+    push @{ $self->{equals} }, {
+        kind       => $kind,
+        points     => [
+            { index => $prev_pivot->{barIndex}, ts => $prev_pivot->{barTime},
+              price => $prev_pivot->{currentLevel} },
+            $new_point,
+        ],
+        price      => $new_point->{price},
+        last_index => $new_point->{index},
+    };
 }
 
 # =============================================================================

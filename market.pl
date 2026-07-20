@@ -111,7 +111,7 @@ my @csv_groups = (
     ['data/2026_04.csv', '2026_04.csv', '../data/2026_04.csv',
      'data/2026_03.csv', '2026_03.csv', '../data/2026_03.csv'],
     ['data/2026_05.csv', '2026_05.csv', '../data/2026_05.csv'],
-    ['data/2026_06_29.csv', '2026_06_29.csv', '../data/2026_06_29.csv'],
+    ['data/2026_06.csv', '2026_06.csv', '../data/2026_06.csv'],
     # Cuarto grupo (entrega 2): continua la serie desde donde termina
     # 2026_06_29.csv. Si hay velas solapadas entre ambos archivos (este
     # arranca el 2026-07-01), el guard $last_ts de mas abajo las descarta
