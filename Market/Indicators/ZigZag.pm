@@ -334,9 +334,7 @@ sub _update_internal {
 #
 #   if high[1] == swingHigh[1] and high < swingHigh:
 #       barIndexHigh := bar_index[1]
-#       priceHigh    := low[1]      # OJO: el script usa el LOW de la vela
-#                                   # pico, no su high -- se replica tal cual
-#                                   # para calzar pixel a pixel con TradingView
+#       priceHigh    := high[1]     # high de la vela pico (mecha superior)
 #   if low[1] == swingLow[1] and low > swingLow:
 #       barIndexLow := bar_index[1]
 #       priceLow    := low[1]
@@ -376,7 +374,7 @@ sub _update_external {
         my $prevc = $arr->[$i-1];
         if ($prevc->{high} == $sh1 && $c->{high} < $sh) {
             $self->{_ext_h_idx}   = $i - 1;
-            $self->{_ext_h_price} = $prevc->{low};   # replica exacta del Pine
+            $self->{_ext_h_price} = $prevc->{high};
         }
         if ($prevc->{low} == $sl1 && $c->{low} > $sl) {
             $self->{_ext_l_idx}   = $i - 1;
