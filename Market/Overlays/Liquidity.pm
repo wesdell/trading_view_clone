@@ -235,7 +235,16 @@ sub _render_equals {
 
 # -----------------------------------------------------------------------------
 # Eventos Sweep / Grab / Run: marcador en la vela de resolucion + chip solido
-# (anti-solape, prioriza los mas recientes).
+# (anti-solape, prioriza los mas recientes) MAS una linea que lo conecta con
+# el nivel de liquidez del PASADO que le dio origen (revision profesor,
+# entrega 3: "las etiquetas deben referirse a un nivel del pasado y se debe
+# dibujar una linea que conecte a las dos: SWEEP_________SWEEP").
+#
+# Cada evento ya trae level_id (Indicators::Liquidity::_resolve). Ese id
+# referencia un nivel de get_levels(), que SIEMPRE conserva index/ts/price
+# de ORIGEN (la vela del swing que lo formo, Req 4 del PDF) -- get_levels()
+# nunca se poda (solo el working set interno _open_level_refs se acota), asi
+# que el origen de cualquier evento historico visible sigue disponible.
 #
 # FIX-LQ2 (v2 -- clustering por cercania, no por indice exacto):
 # Una sola racha volatil puede resolver varios niveles HISTORICAMENTE
@@ -248,7 +257,9 @@ sub _render_equals {
 # el mismo punto del grafico. Por eso se agrupan por CERCANIA: mismo
 # type+dir Y separados por <= CLUSTER_GAP velas entre resoluciones
 # consecutivas -> un solo marcador con contador ("SSL GRAB x4"), anclado a
-# la vela MAS RECIENTE del grupo, en vez de N chips sueltos.
+# la vela MAS RECIENTE del grupo, en vez de N chips sueltos. El agrupado
+# SOLO afecta al marcador/chip de resolucion: la linea de origen se dibuja
+# por EVENTO individual (cada uno puede venir de un nivel distinto).
 # -----------------------------------------------------------------------------
 sub _render_events {
     my ( $self, $canvas, $scale, $src, $placed ) = @_;
@@ -274,6 +285,13 @@ sub _render_events {
     # get_events() ya viene en orden cronologico de resolucion, pero no lo
     # asumimos: el clustering por cercania depende de recorrerlos ordenados.
     @visible = sort { $a->{index} <=> $b->{index} } @visible;
+
+    # --- Paso 1b: lineas de origen, UNA POR EVENTO (antes de agrupar, para
+    # no perder el nivel de origen individual de cada uno dentro de un grupo).
+    my $levels = $src->can('get_levels') ? $src->get_levels : undef;
+    for my $ev (@visible) {
+        $self->_render_event_origin_line( $canvas, $scale, $levels, $ev, $off, $vb );
+    }
 
     # --- Paso 2: clustering por cercania (no por indice exacto) ---
     my @groups;
@@ -326,6 +344,77 @@ sub _render_events {
             -color => $color, -style => 'solid',
             -place => ( $up ? 'above' : 'below' ), -placed => $placed );
     }
+}
+
+# -----------------------------------------------------------------------------
+# _render_event_origin_line: dibuja la conexion nivel-de-origen -> resolucion
+# de UN evento (SWEEP_________SWEEP). El nivel de origen es la vela del swing
+# que lo formo (level.index/level.price), buscado por $ev->{level_id} via
+# _find_level_by_id (busqueda binaria: get_levels() esta ordenado por id
+# ascendente porque se hace push en orden de creacion, aunque el id NO es
+# contiguo -- se comparte el contador con Indicators::Liquidity::_register_swing).
+# Linea punteada fina + marcador circular pequeno en el origen (estilo
+# "outline", igual criterio visual que EQH/EQL) y el mismo texto corto del
+# tipo de evento (SWEEP/GRAB/RUN) para dejar explicito que es el mismo par.
+# -----------------------------------------------------------------------------
+sub _render_event_origin_line {
+    my ( $self, $canvas, $scale, $levels, $ev, $off, $vb ) = @_;
+    return unless $levels && defined $ev->{level_id};
+
+    my $lv = _find_level_by_id( $levels, $ev->{level_id} );
+    return unless $lv && defined $lv->{index};
+    return if $lv->{index} >= $ev->{index};   # el origen debe ser estrictamente anterior
+
+    # El origen puede estar fuera de la ventana visible por la izquierda --
+    # se recorta la linea al borde del plot en vez de descartarla entera,
+    # igual criterio que las lineas BSL/SSL "resting" (_render_levels).
+    return if $lv->{index} > $off + $vb;   # origen mas alla del borde derecho visible: nada que conectar aun
+    return unless $scale->value_in_range( $lv->{price} )
+               || $scale->value_in_range( $ev->{price} );
+
+    my $x1 = $scale->index_to_center_x( $lv->{index} );
+    $x1 = 0 if $x1 < 0;
+    my $x2 = $scale->index_to_center_x( $ev->{index} );
+    return if $x2 <= $x1;
+
+    my $y1 = $scale->value_to_y( $lv->{price} );
+    my $y2 = $scale->value_to_y( $ev->{price} );
+
+    my $up    = ( $ev->{dir} eq 'up' );
+    my $color =
+        ( $ev->{type} eq 'GRAB' ) ? C_GRAB
+      : ( $ev->{type} eq 'RUN' )  ? C_RUN
+      : ( $up ? C_BSL : C_SSL );
+
+    $canvas->createLine( $x1, $y1, $x2, $y2,
+        -fill => $color, -dash => [ 3, 3 ], -width => 1, -tags => [TAG] );
+    $canvas->createOval( $x1 - 2, $y1 - 2, $x1 + 2, $y1 + 2,
+        -outline => $color, -fill => '#ffffff', -tags => [TAG] );
+
+    # Etiqueta pequena en el extremo de origen (mismo texto que el evento,
+    # estilo outline/sobrio para no competir con el chip solido de resolucion).
+    $self->_chip( $canvas, $x1, $y1, $ev->{type},
+        -color => $color, -style => 'outline',
+        -place => ( $up ? 'below' : 'above' ), -offset => 8 );
+}
+
+# -----------------------------------------------------------------------------
+# _find_level_by_id: get_levels() esta ordenado ascendente por id (push en
+# orden de creacion), pero el id NO es contiguo (contador compartido con los
+# swings de Indicators::Liquidity) -- busqueda binaria en vez de indexado
+# directo por id-1.
+# -----------------------------------------------------------------------------
+sub _find_level_by_id {
+    my ( $levels, $id ) = @_;
+    my ( $lo, $hi ) = ( 0, $#$levels );
+    while ( $lo <= $hi ) {
+        my $mid = int( ( $lo + $hi ) / 2 );
+        my $mid_id = $levels->[$mid]{id};
+        if    ( $mid_id == $id ) { return $levels->[$mid]; }
+        elsif ( $mid_id <  $id ) { $lo = $mid + 1; }
+        else                     { $hi = $mid - 1; }
+    }
+    return undef;
 }
 
 sub _min { my $m = shift; for (@_) { $m = $_ if $_ < $m } return $m; }
